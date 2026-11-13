@@ -124,6 +124,28 @@ class PackageRunTests(unittest.TestCase):
                 self.assertEqual(result["pending_rows"], plan["shards"][0]["rows"] if tamper else 0)
                 self.assertTrue((root / "output/package-content/plan/runtime-provenance.json").is_file())
 
+    def test_boolean_and_float_ledger_indices_cannot_complete_package_coverage(self) -> None:
+        for invalid_index in (True, 1.0):
+            with self.subTest(index=invalid_index), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                plan_path, plan = self.make_plan(root)
+                artifacts = root / "artifacts"
+                target_shard = next(
+                    entry["id"] for entry in plan["shards"]
+                    if any(row["index"] == 1 for row in plan_shards.parse_inventory(
+                        plan_path.parent / entry["inventory"]))
+                )
+                shard = self.make_artifact(artifacts, plan_path.parent, plan, target_shard)
+                ledger = shard / ".bounded-results.jsonl"
+                records = [json.loads(line) for line in ledger.read_text().splitlines()]
+                target = next(record for record in records if record["index"] == 1)
+                target["index"] = invalid_index
+                ledger.write_text("".join(json.dumps(record) + "\n" for record in records))
+                result = package_run.package(plan_path, artifacts, root / "output")
+                self.assertFalse(result["complete"])
+                self.assertGreater(result["pending_rows"], 0)
+                self.assertTrue(any("invalid_ledger_rows" in issue for issue in result["issues"]))
+
     def test_source_mismatch_keeps_the_shard_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

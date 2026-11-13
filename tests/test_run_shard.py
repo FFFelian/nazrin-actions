@@ -17,6 +17,33 @@ SPEC.loader.exec_module(run_shard)
 
 
 class TerminalCoverageTests(unittest.TestCase):
+    def test_runtime_provenance_is_required_for_nonempty_resume_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output = root / "source", root / "output"
+            source.mkdir()
+            output.mkdir()
+            runtime = {
+                "source_commit": "a" * 40,
+                "mathlib_commit": "b" * 40,
+                "runtime_manifest_sha256": "c" * 64,
+            }
+            runtime_path = source / ".nazrin-actions-runtime.json"
+            runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+            self.assertEqual(run_shard.bind_runtime_provenance(source, output, "a" * 40)[0], runtime)
+            self.assertTrue((output / "runtime-provenance.json").is_file())
+
+            (output / "runtime-provenance.json").unlink()
+            (output / "shard-input.tsv").write_text("stale state\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no runtime provenance"):
+                run_shard.bind_runtime_provenance(source, output, "a" * 40)
+
+            (output / "runtime-provenance.json").write_text("{}", encoding="utf-8")
+            runtime["runtime_manifest_sha256"] = "d" * 64
+            runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "different assembled runtime"):
+                run_shard.bind_runtime_provenance(source, output, "a" * 40)
+
     @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc/self/stat").exists(),
                          "requires Linux /proc process identities")
     def test_reaps_workers_after_supervisor_and_session_leader_exit(self) -> None:
@@ -111,6 +138,19 @@ class TerminalCoverageTests(unittest.TestCase):
             self.assertEqual(pending, rows)
             self.assertEqual(stats["terminal_rows"], 0)
             self.assertEqual(stats["invalid_ledger_rows"], 2)
+
+    def test_boolean_and_float_indices_never_alias_integer_inventory_keys(self) -> None:
+        row = {"index": 1, "theorem": "Test.pending", "module": "Mathlib.Test"}
+        for invalid_index in (True, 1.0):
+            with self.subTest(index=invalid_index), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp)
+                (output / "trace.txt").write_text("trace\n", encoding="utf-8")
+                record = {**row, "index": invalid_index, "status": "success", "filename": "trace.txt"}
+                (output / ".bounded-results.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+                pending, stats = run_shard.terminal_coverage([row], output)
+                self.assertEqual(pending, [row])
+                self.assertEqual(stats["terminal_rows"], 0)
+                self.assertEqual(stats["invalid_ledger_rows"], 1)
 
 
 if __name__ == "__main__":

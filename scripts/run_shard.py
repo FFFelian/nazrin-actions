@@ -36,6 +36,29 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def bind_runtime_provenance(source: Path, output: Path, expected_commit: str) -> tuple[dict[str, Any], str]:
+    runtime_path = source / ".nazrin-actions-runtime.json"
+    if runtime_path.is_symlink() or not runtime_path.is_file():
+        raise ValueError("assembled runtime provenance is missing or unsafe")
+    runtime_bytes = runtime_path.read_bytes()
+    runtime = json.loads(runtime_bytes)
+    if not isinstance(runtime, dict) or runtime.get("source_commit") != expected_commit.lower():
+        raise ValueError("assembled runtime source identity mismatch")
+    runtime_manifest_sha256 = runtime.get("runtime_manifest_sha256")
+    if not isinstance(runtime_manifest_sha256, str) or len(runtime_manifest_sha256) != 64:
+        raise ValueError("assembled runtime manifest digest is invalid")
+    runtime_copy = output / "runtime-provenance.json"
+    if runtime_copy.is_symlink():
+        raise ValueError("existing runtime provenance is unsafe")
+    if runtime_copy.exists():
+        if not runtime_copy.is_file() or runtime_copy.read_bytes() != runtime_bytes:
+            raise ValueError("existing shard belongs to a different assembled runtime")
+    elif any(output.iterdir()):
+        raise ValueError("existing shard state has no runtime provenance; refusing to resume")
+    runtime_copy.write_bytes(runtime_bytes)
+    return runtime, runtime_manifest_sha256
+
+
 def _safe_artifact(output: Path, filename: object) -> Path | None:
     if not isinstance(filename, str) or not filename or Path(filename).name != filename:
         return None
@@ -63,8 +86,15 @@ def terminal_coverage(
                     continue
                 try:
                     record = json.loads(line)
-                    key = (record["index"], record["theorem"], record["module"])
-                    if not isinstance(record, dict) or key not in by_key:
+                    if not isinstance(record, dict):
+                        invalid_rows += 1
+                        continue
+                    index, theorem, module = record.get("index"), record.get("theorem"), record.get("module")
+                    if type(index) is not int or not isinstance(theorem, str) or not isinstance(module, str):
+                        invalid_rows += 1
+                        continue
+                    key = (index, theorem, module)
+                    if key not in by_key:
                         unknown_rows += 1
                         continue
                     if record.get("status") not in OUTCOME_STATUSES | {"import_failure", "unknown"}:
@@ -269,18 +299,7 @@ def run(args: argparse.Namespace) -> int:
                 f"not requested shard {args.shard_id}"
             )
     output.mkdir(parents=True, exist_ok=True)
-    runtime_path = source / ".nazrin-actions-runtime.json"
-    runtime_manifest_sha256 = None
-    if runtime_path.is_file():
-        runtime_bytes = runtime_path.read_bytes()
-        runtime = json.loads(runtime_bytes)
-        if runtime.get("source_commit") != args.source_commit.lower():
-            raise ValueError("assembled runtime source identity mismatch")
-        runtime_manifest_sha256 = runtime["runtime_manifest_sha256"]
-        runtime_copy = output / "runtime-provenance.json"
-        if runtime_copy.exists() and runtime_copy.read_bytes() != runtime_bytes:
-            raise ValueError("existing shard belongs to a different assembled runtime")
-        runtime_copy.write_bytes(runtime_bytes)
+    runtime, runtime_manifest_sha256 = bind_runtime_provenance(source, output, args.source_commit)
     input_copy = output / "shard-input.tsv"
     digest = sha256(inventory_path)
     if input_copy.exists():

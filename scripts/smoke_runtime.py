@@ -71,7 +71,9 @@ def read_object(path: Path) -> dict[str, Any]:
 
 def expected_manifest(source: Path, project: Path, inventory: Path) -> dict[str, Any]:
     worker = source / ".lake/build/bin/AtomizerWorker"
-    for path in (worker, project / "lake-manifest.json", project / "lean-toolchain"):
+    provenance = source / ".nazrin-actions-runtime.json"
+    supervisor = source / "script/atomize_mathlib_bounded.py"
+    for path in (worker, provenance, supervisor, project / "lake-manifest.json", project / "lean-toolchain"):
         require_file(path)
     # Parse the project manifest as well as binding its exact bytes to the run.
     read_object(project / "lake-manifest.json")
@@ -79,11 +81,21 @@ def expected_manifest(source: Path, project: Path, inventory: Path) -> dict[str,
     require_file(source / "lean-toolchain")
     if not toolchain or (source / "lean-toolchain").read_text(encoding="utf-8").strip() != toolchain:
         raise ValueError("source and project toolchains must match")
+    runtime_identity = read_object(provenance)
+    if (not isinstance(runtime_identity.get("source_commit"), str)
+            or not isinstance(runtime_identity.get("mathlib_commit"), str)
+            or not isinstance(runtime_identity.get("runtime_manifest_sha256"), str)):
+        raise ValueError("assembled runtime provenance is incomplete")
     return {
         "schema": 1,
         "inventory_sha256": sha256(inventory),
         "worker_sha256": sha256(worker),
         "project_manifest_sha256": sha256(project / "lake-manifest.json"),
+        "runtime_provenance_sha256": sha256(provenance),
+        "runtime_manifest_sha256": runtime_identity["runtime_manifest_sha256"],
+        "source_commit": runtime_identity["source_commit"],
+        "mathlib_commit": runtime_identity["mathlib_commit"],
+        "supervisor_sha256": sha256(supervisor),
         "toolchain": toolchain,
         **LIMITS,
         "import_module": "Mathlib",
@@ -200,7 +212,6 @@ def run(source: Path, project: Path, output: Path) -> int:
             os.fsync(handle.fileno())
         manifest = expected_manifest(source, project, inventory)
         report["manifest"] = manifest
-        report["supervisor_sha256"] = sha256(supervisor)
         with (output / "supervisor.log").open("wb") as log:
             completed = subprocess.run(
                 command, cwd=project, env=environment,
@@ -211,7 +222,7 @@ def run(source: Path, project: Path, output: Path) -> int:
             raise ValueError(f"bounded supervisor exited with code {completed.returncode}")
         traces = validate_output(output, manifest)
         # Check inputs again to detect a changed worker/project during the run.
-        if expected_manifest(source, project, inventory) != manifest or sha256(supervisor) != report["supervisor_sha256"]:
+        if expected_manifest(source, project, inventory) != manifest or sha256(supervisor) != manifest["supervisor_sha256"]:
             raise ValueError("runtime inputs changed during the smoke test")
         report.update(status="passed", success_rows=len(traces), traces=traces)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:

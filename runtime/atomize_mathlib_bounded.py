@@ -58,17 +58,54 @@ def append_ledger(path: Path, record: dict) -> None:
         os.fsync(handle.fileno())
 
 
-def load_latest(path: Path) -> dict[tuple[str, str], str]:
+def load_latest(path: Path, inventory_keys: set[tuple[int, str, str]]) -> dict[tuple[int, str, str], str]:
     latest = {}
-    if path.exists():
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    row = json.loads(line)
-                    if row.get("status") in TERMINAL:
-                        latest[row["module"], row["theorem"]] = row["status"]
-                except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-                    continue
+    if path.is_symlink():
+        raise SystemExit("bounded ledger must not be a symlink")
+    if not path.exists():
+        return latest
+
+    valid_lines, rejected_lines = [], []
+    for raw_line in path.read_bytes().splitlines(keepends=True):
+        try:
+            row = json.loads(raw_line)
+            if not isinstance(row, dict):
+                raise ValueError("ledger row is not an object")
+            index, theorem, module = row.get("index"), row.get("theorem"), row.get("module")
+            if type(index) is not int or not isinstance(theorem, str) or not isinstance(module, str):
+                raise ValueError("ledger identity has invalid types")
+            key = (index, theorem, module)
+            if key not in inventory_keys:
+                raise ValueError("ledger identity is outside the inventory")
+            status = row.get("status")
+            if status not in TERMINAL | {"unknown"}:
+                raise ValueError("ledger status is invalid")
+            if status in TERMINAL | {"unknown"}:
+                latest[key] = status
+            valid_lines.append(raw_line if raw_line.endswith(b"\n") else raw_line + b"\n")
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
+            rejected_lines.append(raw_line if raw_line.endswith(b"\n") else raw_line + b"\n")
+
+    if rejected_lines:
+        rejected_path = path.with_name(".bounded-rejected-results.jsonl")
+        if rejected_path.is_symlink():
+            raise SystemExit("rejected ledger archive must not be a symlink")
+        existing = rejected_path.read_bytes() if rejected_path.is_file() else b""
+        combined = existing
+        if combined and not combined.endswith(b"\n"):
+            combined += b"\n"
+        staged = rejected_path.with_name(rejected_path.name + ".tmp")
+        with staged.open("wb") as handle:
+            handle.write(combined + b"".join(rejected_lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, rejected_path)
+        staged = path.with_name(path.name + ".tmp")
+        with staged.open("wb") as handle:
+            handle.write(b"".join(valid_lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
     return latest
 
 
@@ -207,11 +244,26 @@ def execute(args) -> int:
         ["lake", "env", "printenv", "LEAN_PATH"], cwd=project, text=True, timeout=60,
     ).strip()
     env["LEAN_TASK_MANAGER_WORKERS"] = str(args.lean_workers)
+    runtime_report_path = Path(__file__).resolve().parents[1] / ".nazrin-actions-runtime.json"
+    if not regular_file(runtime_report_path):
+        raise SystemExit("assembled runtime provenance is missing; refusing to resume")
+    runtime_report = json.loads(runtime_report_path.read_text(encoding="utf-8"))
+    if (not isinstance(runtime_report, dict)
+            or not isinstance(runtime_report.get("source_commit"), str)
+            or not isinstance(runtime_report.get("mathlib_commit"), str)
+            or not isinstance(runtime_report.get("runtime_manifest_sha256"), str)
+            or len(runtime_report["runtime_manifest_sha256"]) != 64):
+        raise SystemExit("assembled runtime provenance is invalid; refusing to resume")
     manifest = {
         "schema": 1, "inventory_sha256": sha256(inventory),
         "worker_sha256": sha256(worker_bin),
         "project_manifest_sha256": sha256(project / "lake-manifest.json"),
         "toolchain": (project / "lean-toolchain").read_text().strip(),
+        "runtime_provenance_sha256": sha256(runtime_report_path),
+        "runtime_manifest_sha256": runtime_report.get("runtime_manifest_sha256"),
+        "supervisor_sha256": sha256(Path(__file__).resolve()),
+        "source_commit": runtime_report.get("source_commit"),
+        "mathlib_commit": runtime_report.get("mathlib_commit"),
         "timeout_seconds": args.timeout_seconds, "startup_timeout_seconds": args.startup_timeout_seconds,
         "max_heartbeats": args.max_heartbeats, "memory_gib": args.memory_gib,
         "lean_workers": args.lean_workers, "import_module": args.import_module,
@@ -220,37 +272,45 @@ def execute(args) -> int:
     ledger = output / ".bounded-results.jsonl"
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != manifest:
-            raise SystemExit("run manifest differs from this inventory, worker, project, or limits; use a new output directory")
-    elif ledger.exists() and ledger.stat().st_size:
-        raise SystemExit("existing bounded ledger has no version manifest; use a new output directory")
+            raise SystemExit("run manifest differs from this inventory, worker, project, runtime, or limits; use a new output directory")
+    elif any(path.name not in {".bounded.lock", "runtime-provenance.json", "shard-input.tsv",
+                               "fixture-inventory.tsv", "supervisor.log"}
+             for path in output.iterdir()):
+        raise SystemExit("existing bounded state has no version manifest; use a new output directory")
     else:
         write_json(manifest_path, manifest)
-    latest = load_latest(ledger)
     excluded = {int(v) for v in args.exclude_indices.split(",") if v.strip()}
     modules = OrderedDict()
-    reused = 0
+    inventory_keys = set()
+    inventory_rows = []
     with inventory.open(encoding="utf-8") as handle:
         if next(handle, "").rstrip("\r\n") != "index\ttheorem\tmodule":
             raise SystemExit("invalid theorem inventory header")
         for line in handle:
             index_text, theorem, module = line.rstrip("\r\n").split("\t")
             index = int(index_text)
-            if index < args.start_index or index in excluded:
+            key = (index, theorem, module)
+            inventory_keys.add(key)
+            inventory_rows.append((index, theorem, module))
+    latest = load_latest(ledger, inventory_keys)
+    reused = 0
+    for index, theorem, module in inventory_rows:
+        if index < args.start_index or index in excluded:
+            continue
+        if args.mathlib_only and module != "Mathlib" and not module.startswith("Mathlib."):
+            continue
+        status = latest.get((index, theorem, module))
+        artifact = output / (hashlib.sha256(theorem.encode()).hexdigest() + ".txt")
+        if status == "success" and regular_file(artifact) and artifact.stat().st_size > 0:
+            continue
+        if status in TERMINAL - {"success", "import_failure"} and not args.retry_failures:
+            continue
+        if args.reuse_legacy:
+            legacy = output / (theorem + ".txt")
+            if legacy.parent == output and (regular_file(legacy) or (not args.retry_failures and regular_file(Path(str(legacy) + ".log")))):
+                reused += 1
                 continue
-            if args.mathlib_only and module != "Mathlib" and not module.startswith("Mathlib."):
-                continue
-            status = latest.get((module, theorem))
-            artifact = output / (hashlib.sha256(theorem.encode()).hexdigest() + ".txt")
-            if status == "success" and regular_file(artifact) and artifact.stat().st_size > 0:
-                continue
-            if status in TERMINAL - {"success", "import_failure"} and not args.retry_failures:
-                continue
-            if args.reuse_legacy:
-                legacy = output / (theorem + ".txt")
-                if legacy.parent == output and (regular_file(legacy) or (not args.retry_failures and regular_file(Path(str(legacy) + ".log")))):
-                    reused += 1
-                    continue
-            modules.setdefault(args.import_module or module, []).append((index, theorem, module))
+        modules.setdefault(args.import_module or module, []).append((index, theorem, module))
     if args.limit is not None:
         keep = max(0, args.limit)
         selected = OrderedDict()

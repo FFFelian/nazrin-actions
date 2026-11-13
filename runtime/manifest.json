@@ -10,11 +10,35 @@
     "Standalone/Atomizer.lean": "11e92bb3747768362a6e95af76415b0d105f12a7f90e7b6afd4a8a17ac860688"
   },
   "files": [
-    {"path":"Standalone/AtomizerWorker.lean","destination":"Standalone/AtomizerWorker.lean","sha256":"2a0db4b2824788fd1b00ed4bf672a2c6e275dd885024c0b72d52c741e5cb0adc"},
-    {"path":"Standalone/Inventory.lean","destination":"Standalone/Inventory.lean","sha256":"39674ec722294eea644fb855c6b12427ef9f5b1fd6d5a140e4ff2e29794212b0"},
-    {"path":"atomize_mathlib_bounded.py","destination":"script/atomize_mathlib_bounded.py","sha256":"052ecd4cbef37d0e5e324b0b5b7029af411df4c0f1492534242ada60f60e0053"},
-    {"path":"mathlib-project/lakefile.toml","destination":"mathlib-project/lakefile.toml","sha256":"e28273a3e660d17f1794068cb38983e99a1f199464e6429c71437019766d16d9"},
-    {"path":"mathlib-project/lake-manifest.json","destination":"mathlib-project/lake-manifest.json","sha256":"41ffa45306f3dfa09cfc4293ce8dae9caaf75ae02c69e09ff4c28a7e4cb5718e"},
-    {"path":"mathlib-project/lean-toolchain","destination":"mathlib-project/lean-toolchain","sha256":"7dc000621e0046d1aada809e2b7177e64454645cf4c741e9daaf79c99ec2e7a2"}
+    {
+      "path": "Standalone/AtomizerWorker.lean",
+      "destination": "Standalone/AtomizerWorker.lean",
+      "sha256": "2a0db4b2824788fd1b00ed4bf672a2c6e275dd885024c0b72d52c741e5cb0adc"
+    },
+    {
+      "path": "Standalone/Inventory.lean",
+      "destination": "Standalone/Inventory.lean",
+      "sha256": "39674ec722294eea644fb855c6b12427ef9f5b1fd6d5a140e4ff2e29794212b0"
+    },
+    {
+      "path": "atomize_mathlib_bounded.py",
+      "destination": "script/atomize_mathlib_bounded.py",
+      "sha256": "b2c9e865e3f33707ad376e8f86296c9fa5ef46055c4d554461e5b2ba66973390"
+    },
+    {
+      "path": "mathlib-project/lakefile.toml",
+      "destination": "mathlib-project/lakefile.toml",
+      "sha256": "e28273a3e660d17f1794068cb38983e99a1f199464e6429c71437019766d16d9"
+    },
+    {
+      "path": "mathlib-project/lake-manifest.json",
+      "destination": "mathlib-project/lake-manifest.json",
+      "sha256": "41ffa45306f3dfa09cfc4293ce8dae9caaf75ae02c69e09ff4c28a7e4cb5718e"
+    },
+    {
+      "path": "mathlib-project/lean-toolchain",
+      "destination": "mathlib-project/lean-toolchain",
+      "sha256": "7dc000621e0046d1aada809e2b7177e64454645cf4c741e9daaf79c99ec2e7a2"
+    }
   ]
 }

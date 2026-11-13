@@ -42,6 +42,10 @@ class SmokeRuntimeTests(unittest.TestCase):
         supervisor = self.source / "script/atomize_mathlib_bounded.py"
         supervisor.parent.mkdir(parents=True)
         supervisor.write_text("# mocked supervisor; never execute\n", encoding="utf-8")
+        (self.source / ".nazrin-actions-runtime.json").write_text(json.dumps({
+            "source_commit": "a" * 40, "mathlib_commit": "b" * 40,
+            "runtime_manifest_sha256": "c" * 64,
+        }), encoding="utf-8")
         self.project.mkdir()
         for directory in (self.source, self.project):
             (directory / "lean-toolchain").write_text("leanprover/lean4:v4.29.1\n", encoding="utf-8")
@@ -146,12 +150,14 @@ class SmokeRuntimeTests(unittest.TestCase):
         self.assertEqual((self.output / "fixture-inventory.tsv").read_bytes(), smoke.FIXTURE)
 
     def test_setup_preconditions_fail_before_supervisor(self) -> None:
-        for missing in ("LEAN_PATH", "lake"):
+        for missing in ("LEAN_PATH", "lake", "runtime"):
             with self.subTest(missing=missing):
                 output = Path(self.temp.name) / f"missing-{missing}"
                 environment = dict(self.environment)
                 if missing == "LEAN_PATH":
                     environment.pop("LEAN_PATH")
+                elif missing == "runtime":
+                    (self.source / ".nazrin-actions-runtime.json").unlink()
                 with mock.patch.dict(os.environ, environment, clear=True), \
                         mock.patch.object(smoke.shutil, "which", return_value=None if missing == "lake" else "/mock/lake"), \
                         mock.patch.object(smoke.subprocess, "run") as run, \
@@ -159,12 +165,12 @@ class SmokeRuntimeTests(unittest.TestCase):
                     self.assertEqual(smoke.run(self.source, self.project, output), 1)
                 run.assert_not_called()
                 report = json.loads((output / "integration-report.json").read_text())
-                self.assertIn(missing, report["error"])
+                self.assertIn("runtime" if missing == "runtime" else missing, report["error"])
 
     def test_corruption_and_failed_rows_cannot_pass_smoke(self) -> None:
         cases = (
             "partial-ledger", "invalid-json", "non-object", "missing-row", "duplicate-row",
-            "wrong-theorem", "wrong-module", "wrong-index", "boolean-index", "failure", "timeout",
+            "wrong-theorem", "wrong-module", "wrong-index", "boolean-index", "float-index", "failure", "timeout",
             "crash", "import_failure", "invalid_symbol", "unsafe-filename", "missing-trace",
             "empty-trace", "whitespace-trace", "symlink-trace", "invalid-trace-encoding",
             "bad-elapsed", "nan-elapsed", "wrong-manifest", "missing-manifest", "symlink-ledger",
@@ -189,12 +195,13 @@ class SmokeRuntimeTests(unittest.TestCase):
                         self.write_ledger(records[:1])
                     elif case == "duplicate-row":
                         self.write_ledger([records[0], records[0]])
-                    elif case in {"wrong-theorem", "wrong-module", "wrong-index", "boolean-index"}:
+                    elif case in {"wrong-theorem", "wrong-module", "wrong-index", "boolean-index", "float-index"}:
                         field, value = {
                             "wrong-theorem": ("theorem", "Nat.bad"),
                             "wrong-module": ("module", "Other"),
                             "wrong-index": ("index", 99),
                             "boolean-index": ("index", False),
+                            "float-index": ("index", 1.0),
                         }[case]
                         records[0][field] = value
                         self.write_ledger(records)
@@ -250,6 +257,36 @@ class SmokeRuntimeTests(unittest.TestCase):
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_resume_uses_exact_inventory_keys_and_typed_indices(self) -> None:
+        keys = {(1, "Test.valid", "Mathlib.Test")}
+        cases = (
+            ({"index": 1, "theorem": "Test.valid", "module": "Mathlib.Test", "status": "success"}, True),
+            ({"index": 99, "theorem": "Test.valid", "module": "Mathlib.Test", "status": "success"}, False),
+            ({"index": True, "theorem": "Test.valid", "module": "Mathlib.Test", "status": "success"}, False),
+            ({"index": 1.0, "theorem": "Test.valid", "module": "Mathlib.Test", "status": "success"}, False),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = Path(temp) / ".bounded-results.jsonl"
+            for record, accepted in cases:
+                with self.subTest(record=record):
+                    ledger.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                    result = bounded.load_latest(ledger, keys)
+                    self.assertEqual((1, "Test.valid", "Mathlib.Test") in result, accepted)
+
+    def test_stale_ledger_rows_are_quarantined_and_unknown_retries(self) -> None:
+        key = (1, "Test.valid", "Mathlib.Test")
+        valid = {"index": 1, "theorem": key[1], "module": key[2], "status": "success"}
+        stale = {**valid, "index": 99}
+        unknown = {**valid, "status": "unknown"}
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = Path(temp) / ".bounded-results.jsonl"
+            ledger.write_text("".join(json.dumps(row) + "\n" for row in (valid, stale, unknown)), encoding="utf-8")
+            latest = bounded.load_latest(ledger, {key})
+            self.assertEqual(latest[key], "unknown")
+            self.assertEqual([json.loads(line) for line in ledger.read_text().splitlines()], [valid, unknown])
+            rejected = ledger.with_name(".bounded-rejected-results.jsonl")
+            self.assertEqual([json.loads(line) for line in rejected.read_text().splitlines()], [stale])
+
     def worker(self):
         args = argparse.Namespace(max_heartbeats=200_000, memory_gib=10)
         with mock.patch.object(bounded.selectors, "DefaultSelector"):
