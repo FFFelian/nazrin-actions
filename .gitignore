@@ -1,0 +1,18 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials
+.env
+.env.*
+
+# Generated inputs, runtime checkouts and scan outputs
+input/
+outputs/
+plan/
+downloaded-shards/
+final-package/
+.lake/
+*.tar.gz
