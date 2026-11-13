@@ -1,0 +1,14 @@
+-- Paper-aligned NPA proof-evaluation overlay additions.
+--
+-- The pinned upstream lakefile declares neither GoalGraphCore nor NPARepl.
+-- scripts/setup_runtime.sh already assembles AtomizerCore and its Lake target,
+-- so do not redeclare AtomizerCore here.
+
+lean_lib GoalGraphCore {
+  roots := #[`Standalone.GoalGraphCore]
+}
+
+lean_exe NPARepl {
+  root := `Standalone.NPARepl
+  supportInterpreter := true
+}

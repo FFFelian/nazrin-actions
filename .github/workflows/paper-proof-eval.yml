@@ -1,0 +1,726 @@
+name: Paper-aligned NPA proof evaluation
+
+'on':
+  workflow_dispatch:
+    inputs:
+      theorems:
+        description: Repository-relative theorem-list TSV with a theorem column
+        required: true
+        type: string
+        default: paper-eval-overlay/paper-slices/slice-01.tsv
+      shard_count:
+        description: Number of contiguous deterministic shards (1 to 20)
+        required: true
+        type: number
+        default: 10
+      max_parallel:
+        description: Maximum simultaneous shard jobs (1 to 20)
+        required: true
+        type: number
+        default: 10
+      checkpoint_url:
+        description: HTTPS URL of the NPA checkpoint to download and verify
+        required: true
+        type: string
+      checkpoint_sha256:
+        description: Required 64-character SHA256 digest of the checkpoint
+        required: true
+        type: string
+      time_limit:
+        description: Per-theorem proof-search wall-clock budget in seconds
+        required: true
+        type: number
+        default: 15
+      max_steps:
+        description: Maximum tactic attempts per theorem
+        required: true
+        type: number
+        default: 100
+      top_k:
+        description: Candidate tactics decoded per proof state
+        required: true
+        type: number
+        default: 5
+      source_ref:
+        description: Full pinned Codeberg Nazrin base commit SHA
+        required: true
+        type: string
+        default: e34a0535fc767479f7939a98f5699b1a6513a919
+      mathlib_commit:
+        description: Full pinned Mathlib commit SHA
+        required: true
+        type: string
+        default: 5e932f97dd25535344f80f9dd8da3aab83df0fe6
+      runner_label:
+        description: Linux x64 runner label with sufficient memory and disk
+        required: true
+        type: string
+        default: ubuntu-24.04
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paper-proof-eval-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  NAZRIN_SOURCE_URL: https://codeberg.org/aniva/Nazrin.git
+  NAZRIN_SOURCE_REF: ${{ inputs.source_ref }}
+  MATHLIB_COMMIT: ${{ inputs.mathlib_commit }}
+  LEAN_TASK_MANAGER_WORKERS: '2'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  prepare:
+    name: Build NPARepl and plan evaluation shards
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 360
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
+      shard_count: ${{ steps.validate.outputs.shard_count }}
+      max_parallel: ${{ steps.validate.outputs.max_parallel }}
+      checkpoint_sha256: ${{ steps.validate.outputs.checkpoint_sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate dispatch inputs and theorem manifest
+        id: validate
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          MATHLIB_COMMIT: ${{ inputs.mathlib_commit }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          CHECKPOINT_URL: ${{ inputs.checkpoint_url }}
+          CHECKPOINT_SHA256: ${{ inputs.checkpoint_sha256 }}
+          TIME_LIMIT: ${{ inputs.time_limit }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+          TOP_K: ${{ inputs.top_k }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          THEOREMS: ${{ inputs.theorems }}
+        run: |
+          python3 - <<'PY'
+          import math
+          import os
+          from pathlib import Path
+          import re
+          from urllib.parse import urlsplit
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+          for name in ("SOURCE_REF", "MATHLIB_COMMIT"):
+              if not re.fullmatch(r"[0-9a-fA-F]{40}", os.environ[name]):
+                  fail(f"{name} must be a full 40-character Git commit SHA")
+
+          for name, low, high in (("SHARD_COUNT", 1, 20), ("MAX_PARALLEL", 1, 20)):
+              value = os.environ[name]
+              if not value.isdecimal() or not low <= int(value) <= high:
+                  fail(f"{name} must be an integer from {low} to {high}")
+
+          if not os.environ["MAX_STEPS"].isdecimal() or not 1 <= int(os.environ["MAX_STEPS"]) <= 1_000_000:
+              fail("MAX_STEPS must be an integer from 1 to 1000000")
+          if not os.environ["TOP_K"].isdecimal() or not 1 <= int(os.environ["TOP_K"]) <= 1000:
+              fail("TOP_K must be an integer from 1 to 1000")
+          try:
+              time_limit = float(os.environ["TIME_LIMIT"])
+          except ValueError:
+              fail("TIME_LIMIT must be a number")
+          if not math.isfinite(time_limit) or not 0 < time_limit <= 3600:
+              fail("TIME_LIMIT must be greater than 0 and at most 3600 seconds")
+
+          checkpoint_sha = os.environ["CHECKPOINT_SHA256"].strip().lower()
+          if not re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha):
+              fail("CHECKPOINT_SHA256 must be a 64-character hexadecimal digest")
+          try:
+              checkpoint = urlsplit(os.environ["CHECKPOINT_URL"].strip())
+          except ValueError as exc:
+              fail(f"CHECKPOINT_URL is malformed: {exc}")
+          if checkpoint.scheme != "https" or not checkpoint.netloc:
+              fail("CHECKPOINT_URL must be an absolute HTTPS URL")
+          if checkpoint.username or checkpoint.password:
+              fail("CHECKPOINT_URL must not embed credentials")
+
+          if not re.fullmatch(r"[A-Za-z0-9._/-]+", os.environ["RUNNER_LABEL"]):
+              fail("RUNNER_LABEL contains unsupported characters")
+
+          raw = os.environ["THEOREMS"]
+          relative = Path(raw)
+          if not raw or relative.is_absolute() or ".." in relative.parts:
+              fail("THEOREMS must be a repository-relative path without '..'")
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          candidate = workspace / relative
+          if candidate.is_symlink():
+              fail("THEOREMS must not be a symlink")
+          try:
+              candidate = candidate.resolve(strict=True)
+          except FileNotFoundError:
+              fail(f"THEOREMS does not exist: {raw}")
+          try:
+              candidate.relative_to(workspace)
+          except ValueError:
+              fail("THEOREMS escapes the repository workspace")
+          if not candidate.is_file():
+              fail("THEOREMS must name a regular file")
+          try:
+              header = candidate.read_text(encoding="utf-8-sig").splitlines()[0].split("\t")
+          except (OSError, UnicodeDecodeError, IndexError) as exc:
+              fail(f"THEOREMS is not a readable TSV: {exc}")
+          if "theorem" not in header:
+              fail("THEOREMS must contain a theorem column")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"theorems={candidate.relative_to(workspace).as_posix()}\n")
+              output.write(f"shard_count={int(os.environ['SHARD_COUNT'])}\n")
+              output.write(f"max_parallel={int(os.environ['MAX_PARALLEL'])}\n")
+              output.write(f"checkpoint_sha256={checkpoint_sha}\n")
+              output.write(f"time_limit={time_limit}\n")
+              output.write(f"max_steps={int(os.environ['MAX_STEPS'])}\n")
+              output.write(f"top_k={int(os.environ['TOP_K'])}\n")
+          PY
+
+      - name: Verify paper evaluation overlay checksums
+        run: |
+          set -Eeuo pipefail
+          cd paper-eval-overlay
+          sha256sum -c SHA256SUMS
+
+      - name: Bootstrap pinned Nazrin and Mathlib runtime
+        timeout-minutes: 300
+        env:
+          GENERATE_INVENTORY: 'false'
+        run: bash scripts/setup_runtime.sh
+
+      - name: Apply paper evaluation overlay and append Lake targets
+        env:
+          OVERLAY_DIR: ${{ github.workspace }}/paper-eval-overlay
+        run: |
+          set -Eeuo pipefail
+          test -d "$NAZRIN_DIR/Standalone"
+          test -f "$OVERLAY_DIR/lakefile.append"
+          for name in NPARepl.lean GoalGraphCore.lean ExprGraphExport.lean; do
+            cp -a "$OVERLAY_DIR/Standalone/$name" "$NAZRIN_DIR/Standalone/$name"
+          done
+          if [[ ! -e "$NAZRIN_DIR/Standalone/AtomizerCore.lean" ]]; then
+            cp -a "$OVERLAY_DIR/Standalone/AtomizerCore.lean" "$NAZRIN_DIR/Standalone/AtomizerCore.lean"
+          fi
+          mkdir -p "$NAZRIN_DIR/experiments/npa_search" \
+            "$NAZRIN_DIR/experiments/npa_training" \
+            "$NAZRIN_DIR/experiments/npa_data" \
+            "$NAZRIN_DIR/experiments/paper-slices"
+          cp -a "$OVERLAY_DIR/experiments/npa_search/." "$NAZRIN_DIR/experiments/npa_search/"
+          cp -a "$OVERLAY_DIR/experiments/npa_training/." "$NAZRIN_DIR/experiments/npa_training/"
+          cp -a "$OVERLAY_DIR/experiments/npa_data/convert_trace.py" \
+            "$NAZRIN_DIR/experiments/npa_data/convert_trace.py"
+          cp -a "$OVERLAY_DIR/experiments/paper_aligned_npa.py" \
+            "$NAZRIN_DIR/experiments/paper_aligned_npa.py"
+          cp -a "$OVERLAY_DIR/paper-slices/slice-01.tsv" \
+            "$NAZRIN_DIR/experiments/paper-slices/slice-01.tsv"
+          if ! grep -q 'lean_exe NPARepl' "$NAZRIN_DIR/lakefile.lean"; then
+            cat "$OVERLAY_DIR/lakefile.append" >> "$NAZRIN_DIR/lakefile.lean"
+          fi
+          grep -q 'lean_lib GoalGraphCore' "$NAZRIN_DIR/lakefile.lean"
+          grep -q 'lean_exe NPARepl' "$NAZRIN_DIR/lakefile.lean"
+
+      - name: Build NPARepl executable
+        timeout-minutes: 120
+        run: |
+          set -Eeuo pipefail
+          export PATH="$ELAN_HOME/bin:$PATH"
+          cd "$NAZRIN_DIR"
+          lake build NPARepl
+
+      - name: Cache CPU PyTorch wheels
+        continue-on-error: true
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-torch-2.6.0-cpu-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-torch-2.6.0-cpu-
+
+      - name: Install CPU PyTorch
+        run: |
+          set -Eeuo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Download and verify checkpoint
+        env:
+          CHECKPOINT_URL: ${{ inputs.checkpoint_url }}
+          CHECKPOINT_SHA256: ${{ steps.validate.outputs.checkpoint_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/checkpoint" plan
+          target="$RUNNER_TEMP/checkpoint/checkpoint.pt"
+          rm -f "$target"
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 1800 \
+            "$CHECKPOINT_URL" -o "$target"
+          test -s "$target"
+          actual=$(sha256sum "$target" | awk '{print $1}')
+          if [[ "$actual" != "$CHECKPOINT_SHA256" ]]; then
+            printf 'checkpoint digest mismatch: expected %s got %s\n' \
+              "$CHECKPOINT_SHA256" "$actual" >&2
+            exit 1
+          fi
+          python3 - "$target" "$CHECKPOINT_SHA256" "$CHECKPOINT_URL" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          from urllib.parse import urlsplit
+
+          target = Path(sys.argv[1])
+          url = urlsplit(os.environ["CHECKPOINT_URL"])
+          payload = {
+              "schema": 1,
+              "sha256": os.environ["CHECKPOINT_SHA256"],
+              "size_bytes": target.stat().st_size,
+              "filename": "checkpoint.pt",
+              "source": f"{url.scheme}://{url.netloc}{url.path}",
+              "runner_temp_path": str(target),
+          }
+          Path("plan").mkdir(exist_ok=True)
+          Path("plan/checkpoint.json").write_text(
+              json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Plan deterministic contiguous shards
+        id: plan
+        env:
+          THEOREMS: ${{ steps.validate.outputs.theorems }}
+          SHARD_COUNT: ${{ steps.validate.outputs.shard_count }}
+          TIME_LIMIT: ${{ steps.validate.outputs.time_limit }}
+          MAX_STEPS: ${{ steps.validate.outputs.max_steps }}
+          TOP_K: ${{ steps.validate.outputs.top_k }}
+          CHECKPOINT_SHA256: ${{ steps.validate.outputs.checkpoint_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/plan_paper_shards.py \
+            --input "$THEOREMS" \
+            --output plan \
+            --shards "$SHARD_COUNT"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          plan_path = Path("plan/plan.json")
+          plan = json.loads(plan_path.read_text(encoding="utf-8"))
+          inputs = {
+              "schema": 1,
+              "workflow": "paper-proof-eval",
+              "theorems": os.environ["THEOREMS"],
+              "theorems_sha256": plan["input"]["sha256"],
+              "shard_count": int(os.environ["SHARD_COUNT"]),
+              "time_limit": float(os.environ["TIME_LIMIT"]),
+              "max_steps": int(os.environ["MAX_STEPS"]),
+              "top_k": int(os.environ["TOP_K"]),
+              "device": "cpu",
+              "module": "Mathlib",
+              "checkpoint_sha256": os.environ["CHECKPOINT_SHA256"],
+          }
+          Path("plan/evaluation-inputs.json").write_text(
+              json.dumps(inputs, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
+
+          include = [
+              {
+                  "id": shard["id"],
+                  "label": f"{shard['id']:02d}",
+                  "file": shard["file"],
+                  "rows": shard["rows"],
+                  "sha256": shard["sha256"],
+              }
+              for shard in plan["shards"]
+          ]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("matrix=" + json.dumps({"include": include}, separators=(",", ":")) + "\n")
+              output.write("plan_sha256=" + hashlib.sha256(plan_path.read_bytes()).hexdigest() + "\n")
+          PY
+
+      - name: Upload immutable shard plan and checkpoint metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: paper-proof-eval-plan-${{ github.run_id }}
+          path: plan/
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+  shards:
+    name: Shard ${{ matrix.label }}
+    needs: prepare
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download immutable shard plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: paper-proof-eval-plan-${{ github.run_id }}
+          path: plan
+
+      - name: Verify plan and assigned shard digest
+        env:
+          PLAN_SHA256: ${{ needs.prepare.outputs.plan_sha256 }}
+          SHARD_ID: ${{ matrix.id }}
+          SHARD_FILE: ${{ matrix.file }}
+          SHARD_SHA256: ${{ matrix.sha256 }}
+          SHARD_ROWS: ${{ matrix.rows }}
+          CHECKPOINT_SHA256: ${{ needs.prepare.outputs.checkpoint_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          plan_path = Path("plan/plan.json")
+          if hashlib.sha256(plan_path.read_bytes()).hexdigest() != os.environ["PLAN_SHA256"]:
+              raise SystemExit("plan digest mismatch")
+          plan = json.loads(plan_path.read_text(encoding="utf-8"))
+          shard_id = int(os.environ["SHARD_ID"])
+          entry = next((item for item in plan["shards"] if item.get("id") == shard_id), None)
+          name = os.environ["SHARD_FILE"]
+          if entry is None or Path(name).name != name or entry.get("file") != name:
+              raise SystemExit("assigned shard is absent from the plan")
+          path = Path("plan") / name
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          if digest != entry["sha256"] or digest != os.environ["SHARD_SHA256"]:
+              raise SystemExit("assigned shard digest mismatch")
+          rows = sum(1 for _ in path.open(encoding="utf-8")) - 1
+          if rows != int(os.environ["SHARD_ROWS"]):
+              raise SystemExit("assigned shard row count mismatch")
+          checkpoint = json.loads(Path("plan/checkpoint.json").read_text(encoding="utf-8"))
+          if checkpoint.get("sha256") != os.environ["CHECKPOINT_SHA256"]:
+              raise SystemExit("checkpoint metadata digest mismatch")
+          PY
+
+      - name: Bootstrap pinned Nazrin and Mathlib runtime
+        timeout-minutes: 300
+        env:
+          GENERATE_INVENTORY: 'false'
+        run: bash scripts/setup_runtime.sh
+
+      - name: Apply paper evaluation overlay and append Lake targets
+        env:
+          OVERLAY_DIR: ${{ github.workspace }}/paper-eval-overlay
+        run: |
+          set -Eeuo pipefail
+          test -d "$NAZRIN_DIR/Standalone"
+          test -f "$OVERLAY_DIR/lakefile.append"
+          for name in NPARepl.lean GoalGraphCore.lean ExprGraphExport.lean; do
+            cp -a "$OVERLAY_DIR/Standalone/$name" "$NAZRIN_DIR/Standalone/$name"
+          done
+          if [[ ! -e "$NAZRIN_DIR/Standalone/AtomizerCore.lean" ]]; then
+            cp -a "$OVERLAY_DIR/Standalone/AtomizerCore.lean" "$NAZRIN_DIR/Standalone/AtomizerCore.lean"
+          fi
+          mkdir -p "$NAZRIN_DIR/experiments/npa_search" \
+            "$NAZRIN_DIR/experiments/npa_training" \
+            "$NAZRIN_DIR/experiments/npa_data" \
+            "$NAZRIN_DIR/experiments/paper-slices"
+          cp -a "$OVERLAY_DIR/experiments/npa_search/." "$NAZRIN_DIR/experiments/npa_search/"
+          cp -a "$OVERLAY_DIR/experiments/npa_training/." "$NAZRIN_DIR/experiments/npa_training/"
+          cp -a "$OVERLAY_DIR/experiments/npa_data/convert_trace.py" \
+            "$NAZRIN_DIR/experiments/npa_data/convert_trace.py"
+          cp -a "$OVERLAY_DIR/experiments/paper_aligned_npa.py" \
+            "$NAZRIN_DIR/experiments/paper_aligned_npa.py"
+          cp -a "$OVERLAY_DIR/paper-slices/slice-01.tsv" \
+            "$NAZRIN_DIR/experiments/paper-slices/slice-01.tsv"
+          if ! grep -q 'lean_exe NPARepl' "$NAZRIN_DIR/lakefile.lean"; then
+            cat "$OVERLAY_DIR/lakefile.append" >> "$NAZRIN_DIR/lakefile.lean"
+          fi
+          grep -q 'lean_lib GoalGraphCore' "$NAZRIN_DIR/lakefile.lean"
+          grep -q 'lean_exe NPARepl' "$NAZRIN_DIR/lakefile.lean"
+
+      - name: Build NPARepl executable
+        timeout-minutes: 120
+        run: |
+          set -Eeuo pipefail
+          export PATH="$ELAN_HOME/bin:$PATH"
+          cd "$NAZRIN_DIR"
+          lake build NPARepl
+
+      - name: Cache CPU PyTorch wheels
+        continue-on-error: true
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-torch-2.6.0-cpu-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-torch-2.6.0-cpu-
+
+      - name: Install CPU PyTorch
+        run: |
+          set -Eeuo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Download and verify checkpoint
+        env:
+          CHECKPOINT_URL: ${{ inputs.checkpoint_url }}
+          CHECKPOINT_SHA256: ${{ needs.prepare.outputs.checkpoint_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/checkpoint"
+          target="$RUNNER_TEMP/checkpoint/checkpoint.pt"
+          rm -f "$target"
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 1800 \
+            "$CHECKPOINT_URL" -o "$target"
+          test -s "$target"
+          actual=$(sha256sum "$target" | awk '{print $1}')
+          if [[ "$actual" != "$CHECKPOINT_SHA256" ]]; then
+            printf 'checkpoint digest mismatch: expected %s got %s\n' \
+              "$CHECKPOINT_SHA256" "$actual" >&2
+            exit 1
+          fi
+          python3 - "$target" "$CHECKPOINT_SHA256" "$CHECKPOINT_URL" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          from urllib.parse import urlsplit
+
+          target = Path(sys.argv[1])
+          url = urlsplit(os.environ["CHECKPOINT_URL"])
+          payload = {
+              "schema": 1,
+              "sha256": os.environ["CHECKPOINT_SHA256"],
+              "size_bytes": target.stat().st_size,
+              "filename": "checkpoint.pt",
+              "source": f"{url.scheme}://{url.netloc}{url.path}",
+              "runner_temp_path": str(target),
+          }
+          Path("plan").mkdir(exist_ok=True)
+          Path("plan/checkpoint.json").write_text(
+              json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Run paper-aligned NPA evaluation
+        timeout-minutes: 300
+        env:
+          SHARD_ID: ${{ matrix.id }}
+          SHARD_FILE: ${{ matrix.file }}
+          TIME_LIMIT: ${{ inputs.time_limit }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+          TOP_K: ${{ inputs.top_k }}
+          CHECKPOINT_SHA256: ${{ needs.prepare.outputs.checkpoint_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          # ReplClient starts `lake env lean --run "$NAZRIN_DIR/Standalone/NPARepl.lean" Mathlib`
+          # through the LAKE wrapper below, so Lake's workspace is the Mathlib project.
+          export PATH="$ELAN_HOME/bin:$PATH"
+          export PYTHONPATH="$NAZRIN_DIR${PYTHONPATH:+:$PYTHONPATH}"
+          # Point LEAN_PATH at the complete Mathlib Lake search path. The
+          # Mathlib build directory alone is not enough: `import Mathlib`
+          # also needs Batteries, Qq, Aesop, ProofWidgets, and the other
+          # transitive dependencies resolved by the Mathlib project.
+          MATHLIB_LEAN_PATH=$(cd "$MATHLIB_PROJECT_DIR" && lake env printenv LEAN_PATH)
+          export LEAN_PATH="$NAZRIN_DIR/.lake/build/lib/lean:$NAZRIN_DIR/.lake/packages/pantograph/.lake/build/lib/lean:$MATHLIB_LEAN_PATH"
+          launcher="$RUNNER_TEMP/lake-mathlib"
+          cat > "$launcher" <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          cd "${MATHLIB_PROJECT_DIR:?MATHLIB_PROJECT_DIR is not set}"
+          exec "${ELAN_HOME:?ELAN_HOME is not set}/bin/lake" "$@"
+          SH
+          chmod +x "$launcher"
+          export LAKE="$launcher"
+          output="$GITHUB_WORKSPACE/outputs/shard-$SHARD_ID"
+          mkdir -p "$output"
+          cp "$GITHUB_WORKSPACE/plan/$SHARD_FILE" "$output/shard.tsv"
+          cp "$RUNNER_TEMP/checkpoint/checkpoint.json" "$output/checkpoint.json"
+          cd "$MATHLIB_PROJECT_DIR"
+          python3 -m experiments.npa_search.run_eval \
+            --checkpoint "$RUNNER_TEMP/checkpoint/checkpoint.pt" \
+            --module Mathlib \
+            --theorems "$GITHUB_WORKSPACE/plan/$SHARD_FILE" \
+            --output-dir "$output" \
+            --time-limit "$TIME_LIMIT" \
+            --max-steps "$MAX_STEPS" \
+            --top-k "$TOP_K" \
+            --device cpu
+
+      - name: Show remaining runner resources
+        if: always()
+        run: |
+          free -h
+          df -h "$RUNNER_TEMP"
+
+      - name: Record shard metadata
+        if: always()
+        env:
+          SHARD_ID: ${{ matrix.id }}
+          SHARD_FILE: ${{ matrix.file }}
+          SHARD_SHA256: ${{ matrix.sha256 }}
+          SHARD_ROWS: ${{ matrix.rows }}
+          SHARD_COUNT: ${{ needs.prepare.outputs.shard_count }}
+          TIME_LIMIT: ${{ inputs.time_limit }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+          TOP_K: ${{ inputs.top_k }}
+          CHECKPOINT_SHA256: ${{ needs.prepare.outputs.checkpoint_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          output="$GITHUB_WORKSPACE/outputs/shard-$SHARD_ID"
+          mkdir -p "$output"
+          if [[ ! -e "$output/shard.tsv" ]]; then
+            cp "$GITHUB_WORKSPACE/plan/$SHARD_FILE" "$output/shard.tsv"
+          fi
+          if [[ -e "$RUNNER_TEMP/checkpoint/checkpoint.json" && ! -e "$output/checkpoint.json" ]]; then
+            cp "$RUNNER_TEMP/checkpoint/checkpoint.json" "$output/checkpoint.json"
+          fi
+          python3 - "$output" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          payload = {
+              "schema": 1,
+              "shard_id": int(os.environ["SHARD_ID"]),
+              "file": os.environ["SHARD_FILE"],
+              "sha256": os.environ["SHARD_SHA256"],
+              "rows": int(os.environ["SHARD_ROWS"]),
+              "shard_count": int(os.environ["SHARD_COUNT"]),
+              "time_limit": float(os.environ["TIME_LIMIT"]),
+              "max_steps": int(os.environ["MAX_STEPS"]),
+              "top_k": int(os.environ["TOP_K"]),
+              "checkpoint_sha256": os.environ["CHECKPOINT_SHA256"],
+          }
+          (output / "shard.json").write_text(
+              json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload shard evaluation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: paper-proof-eval-shard-${{ matrix.label }}-${{ github.run_id }}
+          path: outputs/shard-${{ matrix.id }}/
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true
+          compression-level: 1
+          retention-days: 14
+
+  package:
+    name: Validate and package evaluation results
+    needs: [prepare, shards]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download plan when available
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: paper-proof-eval-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Download available shard artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: paper-proof-eval-shard-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/downloaded-shards
+          merge-multiple: false
+
+      - name: Aggregate and validate evaluation results
+        env:
+          EXPECTED_PLAN_SHA256: ${{ needs.prepare.outputs.plan_sha256 }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          RUN_ID: ${{ github.run_id }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          CHECKPOINT_SHA256: ${{ needs.prepare.outputs.checkpoint_sha256 }}
+          TIME_LIMIT: ${{ inputs.time_limit }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+          TOP_K: ${{ inputs.top_k }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          MATHLIB_COMMIT: ${{ inputs.mathlib_commit }}
+          THEOREMS: ${{ inputs.theorems }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          SHARDS_RESULT: ${{ needs.shards.result }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/package_proof_eval.py \
+            --plan "$RUNNER_TEMP/plan/plan.json" \
+            --downloads "$RUNNER_TEMP/downloaded-shards" \
+            --output "$RUNNER_TEMP/paper-proof-eval-package" \
+            --run-id "$RUN_ID" \
+            --expected-plan-sha "$EXPECTED_PLAN_SHA256" \
+            --shard-count "$SHARD_COUNT" \
+            --checkpoint-sha256 "$CHECKPOINT_SHA256" \
+            --time-limit "$TIME_LIMIT" \
+            --max-steps "$MAX_STEPS" \
+            --top-k "$TOP_K" \
+            --source-ref "$SOURCE_REF" \
+            --mathlib-commit "$MATHLIB_COMMIT" \
+            --theorems "$THEOREMS" \
+            --prepare-result "$PREPARE_RESULT" \
+            --shards-result "$SHARDS_RESULT" \
+            --step-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evaluation package
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: paper-proof-eval-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paper-proof-eval-package/
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 30
+
+      - name: Fail workflow if evaluation is incomplete
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "paper-proof-eval-package/evaluation-report.json"
+          if not path.is_file():
+              raise SystemExit("paper proof evaluation report is missing")
+          report = json.loads(path.read_text(encoding="utf-8"))
+          if report.get("complete") is not True:
+              raise SystemExit(
+                  "paper proof evaluation incomplete; inspect evaluation-report.json"
+              )
+          totals = report["totals"]
+          if totals["success"] + totals["failure"] + totals["timeout"] + totals["error"] \
+                  != totals["total"]:
+              raise SystemExit("evaluation status totals do not sum to total")
+          print(
+              f"Validated {len(report['shards'])} shards and evaluated {totals['total']} theorems: "
+              f"success={totals['success']} failure={totals['failure']} "
+              f"timeout={totals['timeout']} error={totals['error']}"
+          )
+          PY

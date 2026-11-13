@@ -1,0 +1,19 @@
+-- Paper trace overlay additions.
+--
+-- The pinned upstream lakefile.lean has neither the trace exporter nor
+-- GoalGraphCore.  scripts/setup_runtime.sh already assembles AtomizerCore and
+-- its Lake target before this file is appended, so do not redeclare it here.
+
+lean_lib GoalGraphCore {
+  roots := #[`Standalone.GoalGraphCore]
+}
+
+lean_exe ExprGraphExport {
+  root := `Standalone.ExprGraphExport
+  supportInterpreter := true
+}
+
+lean_exe PaperTraceExport {
+  root := `Standalone.PaperTraceExport
+  supportInterpreter := true
+}

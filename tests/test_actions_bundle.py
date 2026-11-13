@@ -37,13 +37,23 @@ class ActionsBundleTests(unittest.TestCase):
         return next(step for step in self.parsed()["jobs"][job]["steps"]
                     if step.get("name") == name)
 
-    def test_only_one_manual_workflow_and_no_push_or_mirror(self) -> None:
+    def test_manual_workflows_and_no_push_or_mirror(self) -> None:
         workflows = sorted([*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")])
-        self.assertEqual(workflows, [WORKFLOW])
-        self.assertIn("workflow_dispatch:", self.text)
-        self.assertNotRegex(self.text, r"(?m)^\s*(push|pull_request|schedule|workflow_run):")
-        self.assertNotRegex(self.text + self.setup, r"\bgit(?:\s+-C\s+\S+)?\s+push\b|--mirror\b")
-        self.assertNotRegex(self.text, r"\bgh\s+(workflow\s+run|api)\b")
+        self.assertEqual(
+            workflows,
+            [
+                WORKFLOW,
+                WORKFLOW_DIR / "paper-proof-eval.yml",
+                WORKFLOW_DIR / "paper-trace-export.yml",
+            ],
+        )
+        paper_trace = (WORKFLOW_DIR / "paper-trace-export.yml").read_text(encoding="utf-8")
+        paper_eval = (WORKFLOW_DIR / "paper-proof-eval.yml").read_text(encoding="utf-8")
+        all_workflows = self.text + paper_trace + paper_eval
+        self.assertIn("workflow_dispatch:", all_workflows)
+        self.assertNotRegex(all_workflows, r"(?m)^\s*(push|pull_request|schedule|workflow_run):")
+        self.assertNotRegex(all_workflows + self.setup, r"\bgit(?:\s+-C\s+\S+)?\s+push\b|--mirror\b")
+        self.assertNotRegex(all_workflows, r"\bgh\s+(workflow\s+run|api)\b")
         self.assertNotIn("package_results.py", self.text)
 
     def test_dispatch_contract_pins_source_and_mathlib(self) -> None:
