@@ -98,6 +98,32 @@ class PackageRunTests(unittest.TestCase):
                                  f"shard-{shard_id:02d}" / ".bounded-results.jsonl").is_file())
             self.assertTrue(Path(result["archive"]).is_file())
 
+    def test_runtime_provenance_mismatch_revokes_only_affected_shard(self) -> None:
+        for tamper in (False, True):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                plan_path, plan = self.make_plan(root)
+                identity = {"source_commit": plan["source_commit"], "mathlib_commit": "b" * 40,
+                            "runtime_manifest_sha256": "c" * 64}
+                provenance = plan_path.parent / "runtime-provenance.json"
+                provenance.write_text(json.dumps(identity))
+                plan = plan_shards.plan(root / "full-inventory.tsv", plan_path.parent, 2,
+                                        plan["source_commit"], provenance)
+                artifacts = root / "artifacts"
+                for shard_id in range(2):
+                    shard = self.make_artifact(artifacts, plan_path.parent, plan, shard_id)
+                    (shard / "runtime-provenance.json").write_bytes(provenance.read_bytes())
+                    summary_path = shard / "shard-summary.json"
+                    summary = json.loads(summary_path.read_text())
+                    summary["runtime_manifest_sha256"] = identity["runtime_manifest_sha256"]
+                    summary_path.write_text(json.dumps(summary))
+                    if tamper and shard_id == 0:
+                        (shard / "runtime-provenance.json").write_text('{}')
+                result = package_run.package(plan_path, artifacts, root / "output")
+                self.assertEqual(result["complete"], not tamper, result["issues"])
+                self.assertEqual(result["pending_rows"], plan["shards"][0]["rows"] if tamper else 0)
+                self.assertTrue((root / "output/package-content/plan/runtime-provenance.json").is_file())
+
     def test_source_mismatch_keeps_the_shard_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

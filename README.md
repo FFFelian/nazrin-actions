@@ -1,60 +1,54 @@
-# Nazrin Actions orchestration bundle
+# Nazrin Actions orchestration
 
-This repository contains a manual-only GitHub Actions orchestration bundle. It fetches a compatible Nazrin source revision directly from Codeberg at an immutable commit, builds a full pinned Mathlib inventory, assigns deterministic theorem shards, runs one worker per job, and packages verified results. It does not mirror or upload the Nazrin source. The only workflow is [mathlib-atomization.yml](.github/workflows/mathlib-atomization.yml).
+This repository contains independent runner extensions and one manual GitHub Actions workflow, [mathlib-atomization.yml](.github/workflows/mathlib-atomization.yml). At runtime it fetches the official Nazrin base directly from Codeberg, assembles the extensions in a disposable checkout, builds the worker, exports the full pinned Mathlib inventory, assigns deterministic theorem shards, and packages verified results. Upstream source is neither mirrored here nor included in uploaded result artifacts.
 
-## Source compatibility
+## Reproducible runtime assembly
 
-The current upstream revision is not claimed to satisfy the scanner contract. A source commit without the required files and `.nazrin-actions-compatible.json` fails verification before Lean installation, worker build, or inventory generation. Do not bypass that check or point the workflow at an unverified local checkout.
+[runtime/manifest.json](runtime/manifest.json) pins the supported upstream base, Lean toolchain, Mathlib commit, upstream build-file digests, and every independent extension digest:
 
-A compatible immutable revision must provide:
+- Official source: `https://codeberg.org/aniva/Nazrin.git` at `e34a0535fc767479f7939a98f5699b1a6513a919`.
+- Lean: `leanprover/lean4:v4.29.1`.
+- Mathlib: `5e932f97dd25535344f80f9dd8da3aab83df0fe6`, with all transitive Git dependencies locked in the supplied Lake manifest.
 
-- `.nazrin-actions-compatible.json` with schema `1`, the exact worker/core/inventory/supervisor paths, and a `lean_toolchain` matching `lean-toolchain`.
-- `Standalone/AtomizerWorker.lean`, `Standalone/AtomizerCore.lean`, `Standalone/Inventory.lean`, `script/atomize_mathlib_bounded.py`, and a `lakefile.lean` defining `lean_exe AtomizerWorker`.
-- A committed `mathlib-project` Lake workspace whose toolchain matches the source and whose manifest pins exactly one official `leanprover-community/mathlib4` Git dependency to the requested full SHA.
-- An inventory entry point accepting `OUTPUT_TSV MODULE`, exporting the complete `Mathlib` theorem universe with header `index\ttheorem\tmodule`.
-- A bounded supervisor compatible with [run_shard.py](scripts/run_shard.py). It must resume from the immutable complete input and durable ledger, enforce a per-theorem deadline, write validated terminal artifacts, stop after import failure, and continue after theorem timeout/crash.
+[verify_source.py](scripts/verify_source.py) requires a clean checkout at the supported source SHA, verifies the upstream and extension file digests, installs the new worker/inventory/supervisor/project files, and appends only the two required Lake build targets. It extracts `integratedAtomize` and its imports directly from the verified upstream atomizer at runtime. The upstream algorithm is unchanged, and its source is not copied into this repository. The original upstream files remain intact except for the appended Lake targets.
 
-[verify_source.py](scripts/verify_source.py) checks the declared contract, source Git HEAD, both toolchains, worker target, and Mathlib project manifest. This check establishes identity and an explicit integration contract; it does not replace testing the worker itself.
+The assembly records both identities in `.nazrin-actions-runtime.json`; its source SHA describes the base, while its runtime manifest digest and assembled-file digests describe the installed extensions. This replaces the previous, unsatisfiable requirement that upstream provide our local extensions and a `.nazrin-actions-compatible.json` marker. The verifier runs again after build, and setup confirms the installed Mathlib Git HEAD matches the requested SHA.
+
+Before the full inventory is generated, [smoke_runtime.py](scripts/smoke_runtime.py) exercises the real built worker and durable supervisor with two small theorem fixtures importing `Mathlib`. Every fixture must produce a validated successful trace. Failure blocks the full shard matrix. Runtime provenance, the integration report, and logs are preserved under the plan artifact for diagnosis. This fixture is an integration check; the subsequent full scan has no theorem sampling or limit.
 
 ## Dispatch inputs
 
 Run **Mathlib atomization** from **Actions → Mathlib atomization → Run workflow**. Inputs are:
 
-- `source_repository`: fixed to `https://codeberg.org/aniva/Nazrin.git`. Other repositories and Git forge URLs are rejected.
-- `source_ref`: required full 40-character compatible source commit SHA.
-- `mathlib_commit`: full 40-character Mathlib commit SHA; default `5e932f97dd25535344f80f9dd8da3aab83df0fe6`. It must match the source workspace manifest.
+- `source_repository`: fixed to `https://codeberg.org/aniva/Nazrin.git`; other repositories and forge URLs are rejected.
+- `source_ref`: full supported upstream commit SHA, default `e34a0535fc767479f7939a98f5699b1a6513a919`. Supporting another base requires reviewing and updating the runtime manifest.
+- `mathlib_commit`: full Mathlib commit SHA, default `5e932f97dd25535344f80f9dd8da3aab83df0fe6`; it must match the runtime manifest.
 - `shard_count`: 1–128, default 10.
-- `max_parallel`: 1–10, default 10. Use fewer concurrent jobs when runner quota or resources require it.
-- `scan_minutes`: 1–300 per shard, default 300. The workflow may lower the effective runtime to leave time for setup, shutdown, and upload.
-- `runner_label`: default `ubuntu-24.04`. A configured self-hosted Linux x64 runner label may be used if it has sufficient disk, memory, and matching dependencies.
+- `max_parallel`: 1–10, default 10. Reduce this when runner quota or resources require it.
+- `scan_minutes`: 1–300 per shard, default 300. Effective scan time reserves time for setup, shutdown, and upload.
+- `runner_label`: default `ubuntu-24.04`; a configured self-hosted Linux x64 runner label may be used with sufficient disk and memory.
 
-There is no theorem sample or limit. At the known pinned Mathlib revision, the expected candidate universe is **324004 theorems** (261651 Mathlib-owned and 62353 dependency-owned). The inventory is generated from the selected compatible source and Mathlib SHA, so the plan's actual row count and digest are authoritative. Shard assignment is stable: the first 64 bits of `SHA256(module + NUL + theorem)` modulo shard count. The full canonical TSV and every shard TSV are retained in the plan artifact.
+At the pinned Mathlib revision the known candidate universe is **324004 theorems** (261651 Mathlib-owned and 62353 dependency-owned). The generated canonical TSV and its digest are authoritative. Shard assignment uses the first 64 bits of `SHA256(module + NUL + theorem)` modulo shard count. The full canonical inventory and every shard TSV are retained.
 
 ## Runtime model
 
-The prepare job runs orchestration tests, bootstraps the pinned source and Mathlib cache, builds the worker, exports the complete inventory, and plans shards. Each shard job separately fetches and builds the same pinned runtime because GitHub jobs do not share local filesystems. Shard setup sets `GENERATE_INVENTORY=false`; the complete inventory is not regenerated in every worker job. Setup writes `NAZRIN_DIR`, `MATHLIB_PROJECT_DIR`, `ELAN_HOME`, `LEAN_PATH`, `FULL_INVENTORY`, and both commit identities to `GITHUB_ENV`, and adds the elan binary directory through `GITHUB_PATH`. The shard runner then derives the Lake workspace `LEAN_PATH` and prepends the built Nazrin and package libraries.
+Prepare runs the orchestration tests, assembles the pinned runtime, downloads the Mathlib cache, builds the worker, verifies actual worker execution, exports the complete inventory, and plans shards. Each shard separately assembles and builds the identical pinned runtime because jobs do not share filesystems. Shard setup sets `GENERATE_INVENTORY=false`; it does not regenerate the full inventory or run the prepare integration fixture. Setup exports `NAZRIN_DIR`, `MATHLIB_PROJECT_DIR`, `ELAN_HOME`, `LEAN_PATH`, `FULL_INVENTORY`, and both base commit identities through `GITHUB_ENV`, and the elan binary directory through `GITHUB_PATH`. The shard runner derives the Lake workspace `LEAN_PATH` and prepends the built Nazrin/Pantograph libraries.
 
-Each shard runs exactly one `AtomizerWorker` process at a time with two Lean internal task workers. The fixed theorem timeout is **30 seconds**. Worker startup/import has a separate 180-second allowance. The default virtual address-space limit is 10 GiB (`RLIMIT_AS`), not reserved physical RAM. Prior local measurements were roughly 6–7 GiB RSS and can vary; choose runners with enough additional memory. Setup requires 10 GiB free disk initially and at least 2 GiB after build/cache work, which are minimum guards rather than a guarantee the complete run fits.
+Each shard runs one theorem worker at a time with two Lean internal task workers. The theorem deadline is fixed at **30 seconds**; worker startup/import has a separate 180-second allowance. The 10 GiB `RLIMIT_AS` limit bounds virtual address space, not reserved physical RAM. Prior local measurements were roughly 6–7 GiB RSS and can vary. Setup requires at least 10 GiB free disk initially and 2 GiB after build/cache work; these are minimum guards rather than a complete capacity estimate.
 
-Shard jobs have a 350-minute wall-clock cap and reserve 15 minutes for shutdown and artifact upload. The requested `scan_minutes` is an upper bound; a runtime calculation immediately before scanning further reduces it according to elapsed setup time. The setup step itself is capped at 75 minutes. Prepare setup has a 300-minute cap and its job remains within GitHub's six-hour maximum. Timeouts, theorem failures, crashes, and invalid symbols are terminal attempted outcomes, not successful proofs. Import failures, missing/invalid artifacts, and unattempted candidates remain pending.
+Shard jobs have a 350-minute wall-clock cap and reserve 15 minutes for shutdown/upload. Requested `scan_minutes` is an upper bound reduced by elapsed setup time. Shard setup is capped at 75 minutes; prepare setup at 300 minutes, within a six-hour job cap. Timeouts, theorem failures, crashes, and invalid symbols count as attempted terminal outcomes rather than successful proofs. Import failures, malformed or missing artifacts, and unattempted candidates remain pending.
 
-Ten shards are not expected to finish 324004 candidates in one batch. If every theorem used all 30 seconds, ten evenly sized shards would each need about 270 hours of scan time before import/recycle overhead. A budget cutoff keeps the original full shard input, ledger, summary, and exact pending inventory for that run. A new Actions dispatch creates a fresh plan; it does not resume/download a previous run. Any cross-run continuation must explicitly preserve and validate the matching source binary, project manifest, limits, inventory, and state.
+Ten shards are not expected to finish 324004 candidates in one batch. At 30 seconds for every theorem, each of ten balanced shards would need about 270 hours before import/recycle overhead. A budget cutoff retains the full shard input, ledger, summary, and exact pending inventory. A new Actions dispatch creates a fresh plan; it does not resume a previous run. Cross-run continuation requires explicit validation and preservation of matching runtime provenance, binary, manifests, limits, inventory, and state.
 
-The default hosted runner is CPU-only. Lean proof search here does not use an RTX 2070, so assigning a GPU runner alone does not accelerate the workflow. A self-hosted label is useful only if the compatible worker has an actual GPU-backed workload; no CUDA dependency or GPU code is added by this bundle.
+The default hosted runner is CPU-only. This Lean atomization workload does not use an RTX 2070; assigning a GPU alone does not accelerate it. No CUDA workload is added.
 
-## Results and integrity
+## Results and recovery
 
-Plan and shard artifacts use stable run-ID/source/Mathlib-qualified names; shard artifacts also include the shard ID. Package artifacts add the workflow attempt so each package remains available. Uploads include hidden files (`include-hidden-files: true`) so `.bounded-*` supervisor state is preserved. A rerun downloads the prior plan and shard directory before setup/resumption, allowing skipped successful jobs to be reused and failed shards to continue from their ledger. `overwrite: true` lets rerun jobs replace the same plan/shard artifact after restoring its contents. On attempts after the first, a restore failure blocks scanning and replacement uploads to preserve prior results; if no earlier artifact exists, start a fresh dispatch. Budget cutoffs return success after saving state, so use **Re-run all jobs** to resume those shards; **Re-run failed jobs** alone may rerun only packaging. The package job runs with `always()`, downloads available shards without merging their directories, recomputes coverage from the immutable input, ledger, and artifacts, and checks the exact canonical partition. Invalid shard identity cannot subtract rows from the pending inventory; missing, duplicate, unexpected, and mismatched artifacts make the package incomplete.
+Plan and shard artifact names are stable across attempts of the same run and include run/source/Mathlib identities. Package names additionally include the attempt. Uploads include hidden supervisor state. A rerun restores the prior plan and shard directory; `overwrite: true` replaces them only after successful restoration on later attempts. Restore failure blocks scanning and replacement uploads to preserve earlier results. If no original artifact exists, use a new dispatch.
 
-A failed or interrupted shard retains coverage for independently validated committed terminal outcomes while keeping the package incomplete. Missing artifacts and identity/summary mismatches do not count toward coverage. Package construction omits symlinks and includes rejection notes.
+Budget cutoffs return success after saving state, so use **Re-run all jobs** to resume these shards; **Re-run failed jobs** may rerun only packaging. Package runs with `always()`, recomputes coverage from immutable inputs, ledger, and actual artifacts, validates the exact canonical partition, and retains incomplete diagnostics before returning failure. Failed/interrupted shards retain independently validated committed terminal outcomes. Missing artifacts and identity/summary mismatches contribute no coverage. Symlinks are omitted and replaced with rejection notes.
 
-The final artifact contains:
-
-- `nazrin-atomization-results.tar.gz`, with the plan/canonical/shard inventories and shard results under separate namespaces.
-- `package-report.json`, with source identity, coverage, shard status, and validation issues.
-- `pending-inventory.tsv`, listing every planned row without a validated terminal outcome.
-
-If setup/planning fails before a plan exists, the workflow still packages an explicit incomplete diagnostic report and a header-only pending TSV. A header-only file means the candidate universe was unavailable, not that zero candidates are pending. The package is uploaded before incomplete coverage makes the workflow fail.
+The package includes `nazrin-atomization-results.tar.gz`, `package-report.json`, and `pending-inventory.tsv`, preserving available plan and shard inventories/results under separate namespaces. If planning fails, it includes an explicit incomplete report and a header-only pending TSV. A header-only pending TSV means the candidate universe was unavailable, not that nothing remains.
 
 ## Local checks
 
@@ -63,4 +57,4 @@ python3 -B -m unittest discover -s tests -v
 bash -n scripts/setup_runtime.sh
 ```
 
-The helper tests use temporary fixtures; they do not start Lean or affect the existing local scan. No Actions run was started, no source was mirrored, and no existing scan inventory or output was changed while preparing this bundle. A real Actions run still requires a compatible Codeberg source revision and a cold-runner bootstrap check.
+Tests use temporary fixtures and do not run Lean or alter an existing scan. A clean cloud bootstrap and the real worker integration check establish whether the selected runtime can proceed to the full scan.

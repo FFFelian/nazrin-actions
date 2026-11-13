@@ -43,7 +43,7 @@ def stable_shard(module: str, theorem: str, shard_count: int) -> int:
     return value % shard_count
 
 
-def plan(inventory: Path, output: Path, shard_count: int, source_commit: str) -> dict:
+def plan(inventory: Path, output: Path, shard_count: int, source_commit: str, runtime_provenance: Path | None = None) -> dict:
     if not 1 <= shard_count <= 128:
         raise ValueError("shard count must be between 1 and 128")
     if source_commit and not re.fullmatch(r"[0-9a-fA-F]{40}", source_commit):
@@ -83,6 +83,13 @@ def plan(inventory: Path, output: Path, shard_count: int, source_commit: str) ->
         "shard_count": shard_count,
         "shards": shards,
     }
+    if runtime_provenance is not None:
+        runtime = json.loads(runtime_provenance.read_text(encoding="utf-8"))
+        if runtime.get("source_commit") != source_commit.lower():
+            raise ValueError("runtime provenance source identity mismatch")
+        result["runtime_manifest_sha256"] = runtime["runtime_manifest_sha256"]
+        result["runtime_provenance_sha256"] = hashlib.sha256(runtime_provenance.read_bytes()).hexdigest()
+        result["mathlib_commit"] = runtime["mathlib_commit"]
     (output / "plan.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
@@ -93,8 +100,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--shards", type=int, default=10)
     parser.add_argument("--source-commit", default="")
+    parser.add_argument("--runtime-provenance", type=Path)
     args = parser.parse_args()
-    result = plan(args.inventory, args.output, args.shards, args.source_commit)
+    result = plan(args.inventory, args.output, args.shards, args.source_commit, args.runtime_provenance)
     print(json.dumps({"rows": result["inventory"]["rows"], "shard_count": result["shard_count"], "sizes": [s["rows"] for s in result["shards"]]}))
     return 0
 

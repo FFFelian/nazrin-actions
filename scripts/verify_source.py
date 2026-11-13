@@ -1,103 +1,163 @@
 #!/usr/bin/env python3
-"""Fail fast unless a Codeberg revision exposes the required CI worker contract."""
+"""Assemble and verify a pinned upstream checkout plus independent CI extensions."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-REQUIRED_FILES = (
-    "Standalone/AtomizerWorker.lean",
-    "Standalone/AtomizerCore.lean",
-    "Standalone/Inventory.lean",
-    "script/atomize_mathlib_bounded.py",
-    "lakefile.lean",
-    "lake-manifest.json",
-    "lean-toolchain",
-    "mathlib-project/lakefile.toml",
-    "mathlib-project/lake-manifest.json",
-    "mathlib-project/lean-toolchain",
-)
-CONTRACT_FILE = ".nazrin-actions-compatible.json"
+RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
+REPORT = ".nazrin-actions-runtime.json"
+UPSTREAM_FILES = ("lean-toolchain", "lakefile.lean", "lake-manifest.json", "Standalone/Atomizer.lean")
+TARGETS = """
+
+-- Independent Actions runtime targets; the upstream algorithm is unchanged.
+lean_lib AtomizerCore {
+  roots := #[`Standalone.AtomizerCore]
+}
+lean_exe AtomizerWorker {
+  root := `Standalone.AtomizerWorker
+  supportInterpreter := true
+}
+"""
 
 
-def verify(source: Path, expected_commit: str, expected_mathlib_commit: str | None = None) -> dict:
-    source = source.resolve()
-    for label, commit in (("source commit", expected_commit), ("Mathlib commit", expected_mathlib_commit)):
-        if commit is not None and not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
-            raise ValueError(f"{label} must be a full 40-character Git SHA")
-    missing = [name for name in REQUIRED_FILES if not (source / name).is_file()]
-    if missing:
-        raise ValueError("incompatible source revision; missing: " + ", ".join(missing))
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-    marker_path = source / CONTRACT_FILE
-    if not marker_path.is_file():
-        raise ValueError(
-            f"incompatible source revision; missing {CONTRACT_FILE}. "
-            "The ref must explicitly declare this independent Actions runner contract."
-        )
+
+def git(source: Path, *arguments: str) -> bytes:
     try:
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read {CONTRACT_FILE}: {exc}") from exc
-    if not isinstance(marker, dict) or marker.get("schema") != 1:
-        raise ValueError("source compatibility marker must have schema=1")
-    expected_paths = {
-        "worker": "Standalone/AtomizerWorker.lean",
-        "core": "Standalone/AtomizerCore.lean",
-        "inventory": "Standalone/Inventory.lean",
-        "supervisor": "script/atomize_mathlib_bounded.py",
-    }
-    for key, value in expected_paths.items():
-        if marker.get(key) != value:
-            raise ValueError(f"{CONTRACT_FILE}: {key} must be {value!r}")
-
-    lakefile = (source / "lakefile.lean").read_text(encoding="utf-8")
-    if "lean_exe AtomizerWorker" not in lakefile:
-        raise ValueError("source lakefile.lean must define the AtomizerWorker target")
-    toolchain = (source / "lean-toolchain").read_text(encoding="utf-8").strip()
-    if not re.fullmatch(r"leanprover/lean4:v[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9]+)*", toolchain):
-        raise ValueError("lean-toolchain must pin an explicit Lean release")
-    if marker.get("lean_toolchain") != toolchain:
-        raise ValueError("compatibility marker lean_toolchain does not match lean-toolchain")
-    project = source / "mathlib-project"
-    if (project / "lean-toolchain").read_text(encoding="utf-8").strip() != toolchain:
-        raise ValueError("Mathlib project toolchain does not match source toolchain")
-    try:
-        manifest = json.loads((project / "lake-manifest.json").read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("Mathlib project manifest is invalid JSON") from exc
-    packages = manifest.get("packages", []) if isinstance(manifest, dict) else []
-    if not isinstance(packages, list):
-        raise ValueError("Mathlib project manifest packages must be a list")
-    mathlib_entries = [entry for entry in packages if isinstance(entry, dict) and entry.get("name") == "mathlib"]
-    if len(mathlib_entries) != 1:
-        raise ValueError("Mathlib project manifest must contain exactly one mathlib dependency")
-    mathlib = mathlib_entries[0]
-    mathlib_commit = mathlib.get("rev", "")
-    if not isinstance(mathlib_commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", mathlib_commit):
-        raise ValueError("Mathlib manifest revision must be a full 40-character Git SHA")
-    if mathlib.get("type") != "git" or str(mathlib.get("url", "")).removesuffix(".git").rstrip("/") != "https://github.com/leanprover-community/mathlib4":
-        raise ValueError("Mathlib dependency must use the official GitHub repository")
-    if expected_mathlib_commit is not None and mathlib_commit.lower() != expected_mathlib_commit.lower():
-        raise ValueError("Mathlib manifest commit does not match requested mathlib_commit")
-    try:
-        actual_commit = subprocess.check_output(
-            ["git", "-C", str(source), "rev-parse", "--verify", "HEAD"],
-            text=True, stderr=subprocess.PIPE, timeout=15,
-        ).strip().lower()
-        git_root = subprocess.check_output(
-            ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
-            text=True, stderr=subprocess.PIPE, timeout=15,
-        ).strip()
+        return subprocess.check_output(["git", "-C", str(source), *arguments], stderr=subprocess.PIPE, timeout=30)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise ValueError("source must be a checked-out Git revision") from exc
-    if Path(git_root).resolve() != source or actual_commit != expected_commit.lower():
+        raise ValueError("cannot verify upstream Git checkout") from exc
+
+
+def regular(path: Path) -> bytes:
+    if path.is_symlink() or not path.is_file() or any(parent.is_symlink() for parent in path.parents):
+        raise ValueError(f"expected a regular file without symlink parents: {path}")
+    return path.read_bytes()
+
+
+def safe_path(root: Path, name: str) -> Path:
+    relative = PurePosixPath(name)
+    if not name or relative.is_absolute() or any(part in {"..", ".git", ".lake"} for part in relative.parts):
+        raise ValueError(f"invalid runtime path: {name!r}")
+    path = root / name
+    if any(parent.is_symlink() for parent in [path, *path.parents]):
+        raise ValueError(f"runtime path contains a symlink: {name!r}")
+    return path
+
+
+def load_manifest(runtime: Path, expected_commit: str, expected_mathlib_commit: str | None) -> tuple[dict, bytes]:
+    for label, value in (("source_ref", expected_commit), ("mathlib_commit", expected_mathlib_commit)):
+        if value is not None and not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError(f"{label} must be a full 40-character Git SHA")
+    raw = regular(runtime / "manifest.json")
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+        raise ValueError("runtime manifest must have schema=1")
+    if manifest.get("source_commit") != expected_commit.lower():
+        raise ValueError("runtime does not support requested source_ref")
+    if expected_mathlib_commit is not None and manifest.get("mathlib_commit") != expected_mathlib_commit.lower():
+        raise ValueError("runtime does not match requested mathlib_commit")
+    if set(manifest.get("upstream_sha256", {})) != set(UPSTREAM_FILES):
+        raise ValueError("runtime must pin the upstream build and atomizer files")
+    files = manifest.get("files")
+    required = {"Standalone/AtomizerWorker.lean", "Standalone/Inventory.lean", "script/atomize_mathlib_bounded.py",
+                "mathlib-project/lakefile.toml", "mathlib-project/lake-manifest.json", "mathlib-project/lean-toolchain"}
+    if not isinstance(files, list) or {entry.get("destination") for entry in files} != required or len(files) != len(required):
+        raise ValueError("runtime file destinations do not match the integration contract")
+    for entry in files:
+        data = regular(safe_path(runtime, entry["path"]))
+        if sha256(data) != entry["sha256"]:
+            raise ValueError(f"runtime extension digest mismatch: {entry['path']}")
+    return manifest, raw
+
+
+def core_from_upstream(atomizer: bytes) -> bytes:
+    text = atomizer.decode("utf-8")
+    prefix = "def envKeyParallelism"
+    start = "open Pantograph Atomization in\ndef integratedAtomize"
+    end = "\ndef atomizeTask"
+    if any(text.count(boundary) != 1 for boundary in (prefix, start, end)):
+        raise ValueError("upstream atomizer extraction boundaries changed")
+    return (text[:text.index(prefix)] + text[text.index(start):text.index(end)]).encode("utf-8")
+
+
+def expected_files(source: Path, runtime: Path, manifest: dict, *, assembled: bool) -> dict[str, bytes]:
+    actual_root = Path(git(source, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+    actual_commit = git(source, "rev-parse", "--verify", "HEAD").decode().strip().lower()
+    if source != actual_root or actual_commit != manifest["source_commit"]:
         raise ValueError("checked-out Codeberg commit does not match requested source_ref")
-    return {"schema": 1, "source_commit": actual_commit, "mathlib_commit": mathlib_commit.lower(),
-            "toolchain": toolchain, "marker": marker}
+    changed = set(git(source, "diff", "HEAD", "--name-only").decode().splitlines())
+    if changed - ({"lakefile.lean"} if assembled else set()):
+        raise ValueError("upstream tracked source was modified outside runtime assembly")
+    upstream = {}
+    for name, digest in manifest["upstream_sha256"].items():
+        committed = git(source, "show", f"HEAD:{name}")
+        if sha256(committed) != digest:
+            raise ValueError(f"upstream committed file digest mismatch: {name}")
+        expected = committed + TARGETS.encode() if assembled and name == "lakefile.lean" else committed
+        if regular(safe_path(source, name)) != expected:
+            raise ValueError(f"upstream worktree file digest mismatch: {name}")
+        upstream[name] = committed
+    if upstream["lean-toolchain"].decode().strip() != manifest["lean_toolchain"]:
+        raise ValueError("upstream Lean toolchain does not match runtime")
+    output = {entry["destination"]: regular(safe_path(runtime, entry["path"])) for entry in manifest["files"]}
+    output["Standalone/AtomizerCore.lean"] = core_from_upstream(upstream["Standalone/Atomizer.lean"])
+    output["lakefile.lean"] = upstream["lakefile.lean"] + TARGETS.encode()
+    if output["mathlib-project/lean-toolchain"].decode().strip() != manifest["lean_toolchain"]:
+        raise ValueError("Mathlib project toolchain does not match runtime")
+    lake_manifest = json.loads(output["mathlib-project/lake-manifest.json"])
+    entries = [entry for entry in lake_manifest["packages"] if entry.get("name") == "mathlib"]
+    if len(entries) != 1 or entries[0].get("rev") != manifest["mathlib_commit"] or entries[0].get("type") != "git" or entries[0].get("url", "").removesuffix(".git") != "https://github.com/leanprover-community/mathlib4":
+        raise ValueError("Mathlib manifest does not pin the requested official commit")
+    if any(entry.get("type") != "git" or not re.fullmatch(r"[0-9a-f]{40}", entry.get("rev", "")) for entry in lake_manifest["packages"]):
+        raise ValueError("all Mathlib workspace dependencies must pin full Git SHAs")
+    return output
+
+
+def provenance(manifest: dict, raw: bytes, files: dict[str, bytes]) -> dict:
+    return {"schema": 1, "source_commit": manifest["source_commit"], "mathlib_commit": manifest["mathlib_commit"],
+            "toolchain": manifest["lean_toolchain"], "runtime_manifest_sha256": sha256(raw),
+            "assembled_files_sha256": {name: sha256(data) for name, data in sorted(files.items())}}
+
+
+def assemble(source: Path, expected_commit: str, expected_mathlib_commit: str, runtime: Path = RUNTIME) -> dict:
+    source, runtime = source.resolve(), runtime.resolve()
+    manifest, raw = load_manifest(runtime, expected_commit, expected_mathlib_commit)
+    if git(source, "status", "--porcelain", "--untracked-files=all").strip():
+        raise ValueError("assembly requires a clean upstream checkout")
+    files = expected_files(source, runtime, manifest, assembled=False)
+    # Validate every destination before mutating this disposable checkout.
+    for name in [*files, REPORT]:
+        path = safe_path(source, name)
+        if name != "lakefile.lean" and path.exists():
+            raise ValueError(f"refusing to overwrite an existing extension: {name}")
+    for name, data in files.items():
+        path = safe_path(source, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    result = provenance(manifest, raw, files)
+    (source / REPORT).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return verify(source, expected_commit, expected_mathlib_commit, runtime)
+
+
+def verify(source: Path, expected_commit: str, expected_mathlib_commit: str | None = None, runtime: Path = RUNTIME) -> dict:
+    source, runtime = source.resolve(), runtime.resolve()
+    manifest, raw = load_manifest(runtime, expected_commit, expected_mathlib_commit)
+    files = expected_files(source, runtime, manifest, assembled=True)
+    for name, data in files.items():
+        if regular(safe_path(source, name)) != data:
+            raise ValueError(f"assembled runtime digest mismatch: {name}")
+    result = provenance(manifest, raw, files)
+    if json.loads(regular(source / REPORT)) != result:
+        raise ValueError("assembled runtime provenance mismatch")
+    return result
 
 
 def main() -> int:
@@ -105,10 +165,13 @@ def main() -> int:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-mathlib-commit", required=True)
+    parser.add_argument("--runtime", type=Path, default=RUNTIME)
+    parser.add_argument("--assemble", action="store_true")
     args = parser.parse_args()
     try:
-        result = verify(args.source, args.expected_commit, args.expected_mathlib_commit)
-    except (OSError, ValueError) as exc:
+        operation = assemble if args.assemble else verify
+        result = operation(args.source, args.expected_commit, args.expected_mathlib_commit, args.runtime)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, indent=2))
     return 0

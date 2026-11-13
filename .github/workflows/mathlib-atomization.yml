@@ -4,14 +4,15 @@ name: Mathlib atomization
   workflow_dispatch:
     inputs:
       source_repository:
-        description: HTTPS Codeberg repository exposing the compatible worker contract
+        description: Official Codeberg upstream repository for the pinned base source
         type: string
         required: true
         default: https://codeberg.org/aniva/Nazrin.git
       source_ref:
-        description: Full 40-character Codeberg commit SHA implementing the compatible worker contract
+        description: Full Codeberg base commit SHA supported by the independent runtime manifest
         type: string
         required: true
+        default: e34a0535fc767479f7939a98f5699b1a6513a919
       mathlib_commit:
         description: Full Mathlib commit SHA pinned by the compatible source project
         type: string
@@ -118,7 +119,8 @@ jobs:
         run: |
           python3 scripts/plan_shards.py \
             --inventory "$FULL_INVENTORY" --output plan \
-            --shards "$SHARD_COUNT" --source-commit "$NAZRIN_SOURCE_REF"
+            --shards "$SHARD_COUNT" --source-commit "$NAZRIN_SOURCE_REF" \
+            --runtime-provenance plan/runtime-provenance.json
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path

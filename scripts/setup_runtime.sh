@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-: "${NAZRIN_SOURCE_REF:?Set a full Codeberg commit SHA containing the compatible CI worker contract}"
+: "${NAZRIN_SOURCE_REF:?Set the full Codeberg base commit SHA supported by runtime/manifest.json}"
 : "${MATHLIB_COMMIT:?Set the pinned Mathlib commit SHA}"
 : "${RUNNER_TEMP:?RUNNER_TEMP must be set by GitHub Actions}"
 : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set by GitHub Actions}"
@@ -67,7 +67,7 @@ clone_commit "$NAZRIN_SOURCE_URL" "$NAZRIN_SOURCE_REF" "$NAZRIN_DIR"
 python3 "$GITHUB_WORKSPACE/scripts/verify_source.py" \
   --source "$NAZRIN_DIR" \
   --expected-commit "$NAZRIN_SOURCE_REF" \
-  --expected-mathlib-commit "$MATHLIB_COMMIT"
+  --expected-mathlib-commit "$MATHLIB_COMMIT" --assemble
 
 TOOLCHAIN=$(<"$NAZRIN_DIR/lean-toolchain")
 mkdir -p "$ELAN_HOME"
@@ -95,6 +95,15 @@ export LEAN_TASK_MANAGER_WORKERS=2
   lake build AtomizerWorker
 )
 
+python3 "$GITHUB_WORKSPACE/scripts/verify_source.py" \
+  --source "$NAZRIN_DIR" --expected-commit "$NAZRIN_SOURCE_REF" \
+  --expected-mathlib-commit "$MATHLIB_COMMIT"
+actual_mathlib_commit=$(git -C "$MATHLIB_PROJECT_DIR/.lake/packages/mathlib" rev-parse HEAD)
+if [[ "${actual_mathlib_commit,,}" != "${MATHLIB_COMMIT,,}" ]]; then
+  printf 'Installed Mathlib checkout does not match requested commit\n' >&2
+  exit 4
+fi
+
 # Keep the supervisor's Lake environment and the worker's Mathlib dependency on
 # the same manifest, then add Nazrin/Pantograph modules built at the same commit.
 MATHLIB_LEAN_PATH=$(cd "$MATHLIB_PROJECT_DIR" && lake env printenv LEAN_PATH)
@@ -107,7 +116,14 @@ while IFS= read -r package_dir; do
 done < <(find "$NAZRIN_DIR/.lake/packages" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
 export LEAN_PATH="$NAZRIN_LEAN_PATH:$MATHLIB_LEAN_PATH"
 
+# Exercise the real worker/Mathlib import and durable supervisor protocol before
+# generating the full inventory or launching a long-running shard.
 if [[ "$GENERATE_INVENTORY" == true ]]; then
+  mkdir -p "$GITHUB_WORKSPACE/plan"
+  cp "$NAZRIN_DIR/.nazrin-actions-runtime.json" "$GITHUB_WORKSPACE/plan/runtime-provenance.json"
+  python3 "$GITHUB_WORKSPACE/scripts/smoke_runtime.py" \
+    --source "$NAZRIN_DIR" --project "$MATHLIB_PROJECT_DIR" \
+    --output "$GITHUB_WORKSPACE/plan/integration-attempt-${GITHUB_RUN_ATTEMPT:-1}"
   (
     cd "$MATHLIB_PROJECT_DIR"
     lake env lean --run "$NAZRIN_DIR/Standalone/Inventory.lean" "$FULL_INVENTORY" Mathlib
@@ -132,4 +148,4 @@ fi
   printf 'LEAN_PATH=%s\n' "$LEAN_PATH"
   printf 'FULL_INVENTORY=%s\n' "$FULL_INVENTORY"
 } >> "$GITHUB_ENV"
-printf 'Compatible Codeberg source and pinned Mathlib setup completed.\n'
+printf 'Pinned Codeberg base plus verified independent Actions runtime setup completed.\n'

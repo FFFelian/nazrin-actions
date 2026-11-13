@@ -269,6 +269,18 @@ def run(args: argparse.Namespace) -> int:
                 f"not requested shard {args.shard_id}"
             )
     output.mkdir(parents=True, exist_ok=True)
+    runtime_path = source / ".nazrin-actions-runtime.json"
+    runtime_manifest_sha256 = None
+    if runtime_path.is_file():
+        runtime_bytes = runtime_path.read_bytes()
+        runtime = json.loads(runtime_bytes)
+        if runtime.get("source_commit") != args.source_commit.lower():
+            raise ValueError("assembled runtime source identity mismatch")
+        runtime_manifest_sha256 = runtime["runtime_manifest_sha256"]
+        runtime_copy = output / "runtime-provenance.json"
+        if runtime_copy.exists() and runtime_copy.read_bytes() != runtime_bytes:
+            raise ValueError("existing shard belongs to a different assembled runtime")
+        runtime_copy.write_bytes(runtime_bytes)
     input_copy = output / "shard-input.tsv"
     digest = sha256(inventory_path)
     if input_copy.exists():
@@ -396,6 +408,7 @@ def run(args: argparse.Namespace) -> int:
         "shard_id": args.shard_id,
         "status": status,
         "source_commit": args.source_commit.lower(),
+        "runtime_manifest_sha256": runtime_manifest_sha256,
         "inventory_sha256": digest,
         "timeout_seconds_per_theorem": args.timeout_seconds,
         "lean_internal_workers": args.internal_workers,

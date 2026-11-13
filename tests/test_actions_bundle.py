@@ -98,7 +98,10 @@ class ActionsBundleTests(unittest.TestCase):
             'export LEAN_PATH="$NAZRIN_LEAN_PATH:$MATHLIB_LEAN_PATH"',
         ):
             self.assertIn(required, self.setup)
+        self.assertIn("--assemble", self.setup)
+        self.assertIn("smoke_runtime.py", self.setup)
         self.assertLess(self.setup.index("verify_source.py"), self.setup.index("elan-init.sh"))
+        self.assertLess(self.setup.index("smoke_runtime.py"), self.setup.index('lake env lean --run'))
         self.assertIn("https://codeberg.org/aniva/Nazrin.git", self.setup)
         self.assertNotIn("git push", self.setup)
         self.assertNotIn("--mirror", self.setup)
@@ -262,8 +265,8 @@ class ActionsBundleTests(unittest.TestCase):
     def test_readme_states_scope_and_runtime_limits(self) -> None:
         for required in (
             "324004", "scan_minutes", "30 seconds", "350-minute", "RLIMIT_AS", "10 GiB",
-            ".nazrin-actions-compatible.json", "LEAN_PATH", "pending-inventory.tsv",
-            "No Actions run was started", "A new Actions dispatch creates a fresh plan", "header-only",
+            "runtime/manifest.json", "LEAN_PATH", "pending-inventory.tsv",
+            "upstream algorithm", "A new Actions dispatch creates a fresh plan", "header-only",
         ):
             self.assertIn(required, self.readme)
         self.assertNotRegex(self.readme, r"(?m)^NAZRIN_SOURCE_REF=[0-9a-fA-F]{40}$")

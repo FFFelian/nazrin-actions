@@ -137,6 +137,17 @@ def _validate_plan(plan: dict[str, Any], plan_dir: Path) -> tuple[list[dict[str,
                 issues.append("shard inventories are not an exact partition of the canonical inventory")
     if canonical_rows is not None and len(canonical_rows) == expected_rows:
         inventory_rows = canonical_rows
+    if "runtime_provenance_sha256" in plan:
+        runtime = _safe_child(plan_dir, "runtime-provenance.json")
+        if runtime is None or sha256(runtime) != plan["runtime_provenance_sha256"]:
+            issues.append("plan runtime provenance missing or digest mismatch")
+        else:
+            try:
+                identity = json.loads(runtime.read_text(encoding="utf-8"))
+                if any(identity.get(key) != plan.get(key) for key in ("source_commit", "mathlib_commit", "runtime_manifest_sha256")):
+                    issues.append("plan runtime identity mismatch")
+            except (ValueError, AttributeError):
+                issues.append("malformed plan runtime provenance")
     return inventory_rows, issues
 
 
@@ -190,7 +201,7 @@ def package(plan_path: Path, artifacts_root: Path, destination: Path) -> dict[st
     (staged / "shards").mkdir(parents=True)
     packaged_plan = staged / "plan"
     packaged_plan.mkdir()
-    plan_names = {"plan.json", "canonical-inventory.tsv"}
+    plan_names = {"plan.json", "canonical-inventory.tsv", "runtime-provenance.json"}
     plan_names.update(
         name for item in plan.get("shards", []) if isinstance(item, dict)
         for name in [item.get("inventory")]
@@ -203,6 +214,10 @@ def package(plan_path: Path, artifacts_root: Path, destination: Path) -> dict[st
             target_path.write_text("Rejected symlink in plan artifact.\n", encoding="utf-8")
         elif source_path.is_file():
             shutil.copy2(source_path, target_path)
+
+    for integration in sorted(plan_dir.glob("integration-attempt-*")):
+        if integration.is_dir() and not integration.is_symlink():
+            _copy_tree_without_symlinks(integration, packaged_plan / integration.name)
 
     for shard_id in range(count):
         matches = by_id.get(shard_id, [])
@@ -230,6 +245,12 @@ def package(plan_path: Path, artifacts_root: Path, destination: Path) -> dict[st
                 or summary_source.lower() != plan_source.lower()):
             issues.append(f"source commit mismatch for shard {shard_id}")
             trusted = False
+        if "runtime_manifest_sha256" in plan:
+            runtime_file = _safe_child(artifact_dir, "runtime-provenance.json")
+            if (summary.get("runtime_manifest_sha256") != plan["runtime_manifest_sha256"]
+                    or runtime_file is None or sha256(runtime_file) != plan["runtime_provenance_sha256"]):
+                issues.append(f"runtime provenance mismatch for shard {shard_id}")
+                trusted = False
         if summary.get("inventory_sha256") != entry.get("sha256"):
             issues.append(f"inventory digest mismatch for shard result {shard_id}")
             trusted = False
