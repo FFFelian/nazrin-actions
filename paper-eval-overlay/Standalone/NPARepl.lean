@@ -12,10 +12,16 @@
     request  {"cmd":"close"}
     response NAZRIN_NPA {"status":"ok", ...}
 
+  Every proof-state response carries, per goal, both the v1 single-goal `graph`
+  and the schema-2 whole-state `graph_v2` (with `graph_v2_goal_id` /
+  `graph_v2_root` and a top-level `current_goal_roots` mapping).  See
+  `experiments/exprgraph/v2/schema-v2.md`.
+
   Every response is emitted as exactly one line, prefixed with `NAZRIN_NPA `.
 -/
 import Pantograph.Library
 import Standalone.GoalGraphCore
+import Standalone.ExprGraphV2
 
 open Lean
 open Pantograph
@@ -105,8 +111,44 @@ private def mergeGoals (first second : List MVarId) : List MVarId :=
   second.foldl (init := first) fun acc goal =>
     if acc.contains goal then acc else acc ++ [goal]
 
+/-- An array field extracted without throwing. -/
+private def jsonArrayD (json : Json) (key : String) : Array Json :=
+  match json.getObjValD key with
+  | .arr values => values
+  | _ => #[]
+
+/-- The `(goal_id, root)` pair of one goal in a schema-2 proof-state graph.
+
+The builder (`ExprGraphV2.buildGoalStateGraph`) emits one `goals[]` entry per
+input mvar, in input order, so the graph index is the response goal index. -/
+private def v2GoalRef? (graphV2 : Json) (index : Nat) : Option (String × Nat) := do
+  let some entry := (jsonArrayD graphV2 "goals")[index]? | none
+  let goalId := ExprGraphV2.jsonStrD entry "goal_id"
+  if goalId.isEmpty then none
+  let root ← (entry.getObjValD "root").getNat?.toOption
+  return (goalId, root)
+
+/-- The explicit `response id <-> schema-2 goal_id/root` mapping emitted next to
+    `graph_v2`.  A client that cannot rely on array order can use this table. -/
+private def currentGoalRootsJson (session : Session) (graphV2 : Json) : Array Json :=
+  Id.run do
+    let mut roots := #[]
+    for index in [:session.goals.length] do
+      let mvar := match session.goals[index]? with
+        | some goal => goal.name.toString
+        | none => ""
+      let (goalId, root) := match v2GoalRef? graphV2 index with
+        | some (goalId, root) => (toJson goalId, toJson root)
+        | none => (Json.null, Json.null)
+      roots := roots.push <| Json.mkObj [
+        ("id", toJson index),
+        ("mvar", toJson mvar),
+        ("goal_id", goalId),
+        ("root", root)]
+    return roots
+
 private def goalJson (index : Nat) (goal : Protocol.Goal) (graph : Json)
-    (graphError : Option String) : Json :=
+    (graphError : Option String) (graphV2 : Json) (graphV2Error : Option String) : Json :=
   let target := goal.target.pp?.getD "<unprintable target>"
   let vars := goal.vars.map fun decl =>
     let type := decl.type?.bind (·.pp?) |>.getD "<unprintable type>"
@@ -117,6 +159,15 @@ private def goalJson (index : Nat) (goal : Protocol.Goal) (graph : Json)
   let graphFields := match graphError with
     | some message => [("graph", graph), ("graph_error", toJson message)]
     | none => [("graph", graph)]
+  let graphV2Fields := match graphV2Error with
+    | some message => [("graph_v2", graphV2), ("graph_v2_error", toJson message)]
+    | none =>
+      match v2GoalRef? graphV2 index with
+      | some (goalId, root) =>
+        [("graph_v2", graphV2),
+         ("graph_v2_goal_id", toJson goalId),
+         ("graph_v2_root", toJson root)]
+      | none => [("graph_v2", graphV2)]
   Json.mkObj <|
     [("id", toJson index),
      ("mvar", toJson goal.name.toString),
@@ -124,7 +175,7 @@ private def goalJson (index : Nat) (goal : Protocol.Goal) (graph : Json)
        | some name => toJson name.toString
        | none => Json.null),
      ("target", toJson target),
-     ("vars", toJson vars)] ++ graphFields
+     ("vars", toJson vars)] ++ graphFields ++ graphV2Fields
 
 /-- Build the goal-aware ExprGraph for one live metavariable.  A graph failure
     is reported as `graph:null` plus `graph_error`; it must never abort the
@@ -140,11 +191,32 @@ private def goalGraph (runtime : Runtime) (state : GoalState) (goal : MVarId) :
     let message ← exceptionMessage exception
     return (Json.null, some s!"goal graph failed: {message}")
 
+/-- Build the schema-2 (coupled-goal) graph of the whole proof state.
+
+The metavariable context is taken from `state`; `buildGoalStateGraph` needs it
+to see the proof's fresh mvars.  We enter the local context of the first
+tracked goal: every goal declaration is read through that metavariable
+context, and the first goal's local instances are a pragmatic default for
+typeclass resolution during graph construction.  A failure is reported as
+`graph_v2:null` plus `graph_v2_error`; it never aborts the REPL. -/
+private def stateGraphV2 (runtime : Runtime) (state : GoalState)
+    (goals : List MVarId) : IO (Json × Option String) := do
+  match goals with
+  | [] => return (Json.null, none)
+  | first :: _ =>
+    let coreM := (state.withContext' first (ExprGraphV2.buildGoalStateGraph goals)).run'
+    match ← (coreM.run runtime.coreContext { env := runtime.env }).toBaseIO with
+    | .ok (graph, _) => return (graph, none)
+    | .error exception =>
+      let message ← exceptionMessage exception
+      return (Json.null, some s!"goal-state v2 graph failed: {message}")
+
 /-- Serialize an arbitrary list of goals using the metavariable context of
     `state`.  We temporarily make that list the tactic goal list because
     Pantograph's serializer reads `GoalState.goals`. -/
 private def serializeGoals (runtime : Runtime) (state : GoalState)
-    (goals : List MVarId) : IO (Except Exception (Array Json)) := do
+    (goals : List MVarId) (graphV2 : Json) (graphV2Error : Option String) :
+    IO (Except Exception (Array Json)) := do
   let displayState : GoalState := {
     state with
     savedState := { state.savedState with tactic := { goals := goals } } }
@@ -158,7 +230,8 @@ private def serializeGoals (runtime : Runtime) (state : GoalState)
         let (graph, graphError) ← match goals[index]? with
           | some mvar => goalGraph runtime state mvar
           | none => pure (Json.null, some "goal metavariable missing from tracked list")
-        rendered := rendered.push (goalJson index goal graph graphError)
+        rendered := rendered.push
+          (goalJson index goal graph graphError graphV2 graphV2Error)
     return .ok rendered
   | .error exception =>
     return .error exception
@@ -168,14 +241,18 @@ private def serializeGoals (runtime : Runtime) (state : GoalState)
 private def stateReply (runtime : Runtime) (session : Session)
     (messages : Array String := #[]) (extra : List (String × Json) := []) :
     IO Json := do
-  match ← serializeGoals runtime session.state session.goals with
+  -- One schema-2 graph covers every goal of the state; it is embedded in each
+  -- goal's response (`graph_v2`) together with that goal's `goal_id`/`root`.
+  let (graphV2, graphV2Error) ← stateGraphV2 runtime session.state session.goals
+  match ← serializeGoals runtime session.state session.goals graphV2 graphV2Error with
   | .ok goals =>
     let solved := session.goals.isEmpty && session.state.isSolved
     return okJson <|
       [("theorem", toJson session.theoremName),
        ("goals", toJson goals),
        ("solved", toJson solved),
-       ("messages", toJson messages)] ++ extra
+       ("messages", toJson messages),
+       ("current_goal_roots", Json.arr (currentGoalRootsJson session graphV2))] ++ extra
   | .error exception =>
     let message ← exceptionMessage exception
     return errorJson "tactic_failed" s!"could not serialize goals: {message}"

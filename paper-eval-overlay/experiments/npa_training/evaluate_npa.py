@@ -19,6 +19,7 @@ try:
         count_parameters,
         evaluate_examples,
         load_checkpoint,
+        load_constant_vocab,
         resolve_device,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
@@ -28,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
         count_parameters,
         evaluate_examples,
         load_checkpoint,
+        load_constant_vocab,
         resolve_device,
     )
 
@@ -40,12 +42,22 @@ def evaluate_checkpoint(
     device: str = "cpu",
     limit: int | None = None,
     data_kind: str = "sample",
+    constant_vocab_path: str | Path | None = None,
 ) -> dict[str, Any]:
     resolved_device = resolve_device(device)
     model, vocab, payload = load_checkpoint(checkpoint_path, resolved_device)
+    constant_vocab = vocab.constants
+    if constant_vocab_path is not None:
+        constant_vocab = load_constant_vocab(constant_vocab_path)
+        if constant_vocab != vocab.constants:
+            raise ValueError(
+                "constant vocabulary file does not match the checkpoint vocabulary: "
+                f"{constant_vocab_path} has {len(constant_vocab)} names, checkpoint has "
+                f"{len(vocab.constants)}; the file order defines constant IDs, so they must be identical"
+            )
     dataset = load_dataset(
         data_path,
-        constant_vocab=vocab.constants,
+        constant_vocab=constant_vocab,
         relation_vocab=vocab.relations,
         node_feature_dim=vocab.node_feature_dim,
     )
@@ -79,6 +91,13 @@ def evaluate_checkpoint(
             "examples": len(dataset),
             "split_counts": dataset.split_counts,
         },
+        "constant_vocab_path": (
+            str(constant_vocab_path) if constant_vocab_path is not None else None
+        ),
+        "constant_vocab_sha256": (
+            file_sha256(constant_vocab_path) if constant_vocab_path is not None else None
+        ),
+        "num_constants": model.num_constants,
         "model": {
             "parameter_count": count_parameters(model),
             "num_constants": model.num_constants,
@@ -98,6 +117,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--data-kind", choices=("synthetic", "sample"), default=None)
+    parser.add_argument(
+        "--constant-vocab",
+        type=Path,
+        default=None,
+        help="one-name-per-line constant vocabulary; must match the checkpoint vocabulary order",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser
 
@@ -126,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         limit=args.limit,
         data_kind=data_kind,
+        constant_vocab_path=args.constant_vocab,
     )
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

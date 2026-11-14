@@ -153,6 +153,7 @@ def evaluate_one(
     max_steps: int,
     top_k: int,
     heartbeat_limit: int = 200_000,
+    prefer_graph_v2: bool = True,
 ) -> SearchResult:
     """Run one theorem in a fresh REPL process.
 
@@ -196,6 +197,7 @@ def evaluate_one(
             time_limit=time_limit,
             max_steps=max_steps,
             top_k=top_k,
+            prefer_graph_v2=prefer_graph_v2,
         )
         return engine.prove(theorem)
     finally:
@@ -255,6 +257,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 time_limit=args.time_limit,
                 max_steps=args.max_steps,
                 top_k=args.top_k,
+                prefer_graph_v2=not args.no_graph_v2,
             )
             payload = _json_result(result)
             results.append(payload)
@@ -272,10 +275,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 reason_counts[reason[0][:160]] += 1
     total = len(results)
     summary = {
-        "experiment": "NPA proof search evaluation (v1)",
+        "experiment": "NPA proof search evaluation",
         "paper_fidelity": False,
         "policy": "mock" if mock else "npa",
         "premise_scope": args.premise_scope,
+        "graph_input": "graph_v2-if-present" if not args.no_graph_v2 else "graph (schema 1)",
+        "prefer_graph_v2": not args.no_graph_v2,
         "mock": mock,
         "mock_sequence": args.mock_policy if mock else None,
         "checkpoint": {
@@ -313,6 +318,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 "propose constants outside the checkpoint vocabulary"
             ),
             "mock runs are marked policy=mock and must not be reported as model results",
+            (
+                "each goal response is fed from graph_v2 (schema 2) when the REPL supplies it, "
+                "with the current goal's root selected; --no-graph-v2 forces the v1 graph"
+                if not args.no_graph_v2
+                else "graph_v2 is ignored; the v1 single-goal graph (schema 1) is used"
+            ),
         ],
     }
     summary_path = output_dir / "summary.json"
@@ -339,6 +350,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "premise candidates: 'graph' uses goal-graph constants only; "
             "'global' uses the whole checkpoint constant vocabulary"
         ),
+    )
+    parser.add_argument(
+        "--no-graph-v2",
+        action="store_true",
+        help="ignore the REPL's schema-2 graph_v2 and use the v1 graph (schema 1)",
     )
     parser.add_argument(
         "--mock-policy",

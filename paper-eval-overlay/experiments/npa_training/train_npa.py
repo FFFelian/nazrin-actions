@@ -86,6 +86,35 @@ def count_parameters(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
 
 
+def load_constant_vocab(path: str | Path) -> tuple[str, ...]:
+    """Read a one-name-per-line constant vocabulary, preserving file order.
+
+    The file is expected to be the output of
+    :mod:`experiments.npa_data.build_full_vocab` (sorted and de-duplicated),
+    but any order is accepted: the file order *is* the model's index order, so
+    training and evaluation must use the same file.
+    """
+
+    resolved = Path(path)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"constant vocabulary file not found: {resolved}")
+    names: list[str] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(resolved.read_text(encoding="utf-8").splitlines(), start=1):
+        name = line.strip()
+        if not name:
+            continue
+        if any(character in name for character in "\t\r"):
+            raise ValueError(f"{resolved}:{line_number}: constant name contains a control character")
+        if name in seen:
+            raise ValueError(f"{resolved}:{line_number}: duplicate constant name {name!r}")
+        seen.add(name)
+        names.append(name)
+    if not names:
+        raise ValueError(f"constant vocabulary file is empty: {resolved}")
+    return tuple(names)
+
+
 def model_config_from_vocab(vocab: DatasetVocab) -> dict[str, int]:
     if not vocab.constants:
         raise ValueError(
@@ -358,9 +387,17 @@ def train_model(
     synthetic_states: int = 64,
     synthetic_seed: int = 0,
     states_per_theorem: int = 4,
+    constant_vocab: Sequence[str] | None = None,
+    constant_vocab_path: str | Path | None = None,
     quiet: bool = False,
 ) -> dict[str, Any]:
-    """Train one model and write checkpoint.pt + training-summary.json."""
+    """Train one model and write checkpoint.pt + training-summary.json.
+
+    ``constant_vocab_path`` points at a one-name-per-line vocabulary produced
+    by :mod:`experiments.npa_data.build_full_vocab`; its line order becomes the
+    model's constant-ID order.  When omitted (and ``constant_vocab`` is None),
+    the vocabulary is inferred from the dataset as before.
+    """
 
     started = time.perf_counter()
     if epochs < 1 or batch_size < 1:
@@ -373,6 +410,19 @@ def train_model(
         data_kind = "synthetic" if data_path is None else "sample"
     if data_kind not in ("synthetic", "sample"):
         raise ValueError("data_kind must be 'synthetic' or 'sample'")
+    if constant_vocab is not None and constant_vocab_path is not None:
+        file_vocab = load_constant_vocab(constant_vocab_path)
+        if tuple(constant_vocab) != file_vocab:
+            raise ValueError(
+                "constant_vocab and constant_vocab_path disagree; pass only one, or make them identical"
+            )
+    elif constant_vocab_path is not None:
+        constant_vocab = load_constant_vocab(constant_vocab_path)
+    elif constant_vocab is not None:
+        constant_vocab = tuple(constant_vocab)
+    constant_vocab_sha256 = (
+        file_sha256(Path(constant_vocab_path)) if constant_vocab_path is not None else None
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -384,7 +434,7 @@ def train_model(
             seed=synthetic_seed,
             states_per_theorem=states_per_theorem,
         )
-    dataset = load_dataset(data_path)
+    dataset = load_dataset(data_path, constant_vocab=constant_vocab)
 
     train_examples = list(dataset.split("train"))
     validation_examples = list(dataset.split("validation"))
@@ -404,6 +454,8 @@ def train_model(
         held_out_split = None
 
     resolved_device = resolve_device(device)
+    if resolved_device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(resolved_device)
     set_seed(seed)
     vocab = dataset.vocab
     model = build_model(vocab).to(resolved_device)
@@ -489,6 +541,9 @@ def train_model(
         "data_kind": data_kind,
         "data_path": str(data_path),
         "data_sha256": dataset.source_sha256,
+        "constant_vocab_path": str(constant_vocab_path) if constant_vocab_path is not None else None,
+        "constant_vocab_sha256": constant_vocab_sha256,
+        "num_constants": len(vocab.constants),
         "epochs": epochs,
         "batch_size": batch_size,
         "lr": lr,
@@ -547,6 +602,14 @@ def train_model(
             "held_out_split": held_out_split,
             "held_out_examples": len(held_out_examples),
         },
+        "constant_vocab_path": (
+            str(constant_vocab_path) if constant_vocab_path is not None else None
+        ),
+        "constant_vocab_sha256": constant_vocab_sha256,
+        "num_constants": model.num_constants,
+        "constant_vocab_source": (
+            "file" if constant_vocab_path is not None else ("argument" if constant_vocab is not None else "inferred")
+        ),
         "model": {
             "class": type(model).__name__,
             "hidden_dim": 32,
@@ -591,6 +654,18 @@ def train_model(
         "runtime": {
             **_device_metadata(resolved_device),
             "elapsed_seconds": time.perf_counter() - started,
+            **(
+                {
+                    "peak_cuda_memory_allocated_mb": round(
+                        torch.cuda.max_memory_allocated(resolved_device) / (1024**2), 2
+                    ),
+                    "peak_cuda_memory_reserved_mb": round(
+                        torch.cuda.max_memory_reserved(resolved_device) / (1024**2), 2
+                    ),
+                }
+                if resolved_device.type == "cuda"
+                else {}
+            ),
         },
         "notes": [
             "Synthetic/sample smoke test; do not report these numbers as paper or real-data metrics.",
@@ -623,6 +698,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic-states", type=int, default=64)
     parser.add_argument("--synthetic-seed", type=int, default=0)
     parser.add_argument("--states-per-theorem", type=int, default=4)
+    parser.add_argument(
+        "--constant-vocab",
+        type=Path,
+        default=None,
+        help="one-name-per-line constant vocabulary (e.g. "
+        "experiments/npa_data/full-constant-vocab.txt); file order defines IDs",
+    )
     return parser
 
 
@@ -642,6 +724,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         synthetic_states=args.synthetic_states,
         synthetic_seed=args.synthetic_seed,
         states_per_theorem=args.states_per_theorem,
+        constant_vocab_path=args.constant_vocab,
     )
     print(
         f"wrote {summary['checkpoint']['path']} and "

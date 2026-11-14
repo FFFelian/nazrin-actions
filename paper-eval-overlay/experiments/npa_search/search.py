@@ -6,6 +6,10 @@ Model logits are used exclusively to order candidate tactics.
 
 First-version scope and limitations are documented in ``README.md``:
 
+* REPL goal graphs may be schema 1 (one closed goal) or schema 2 (a coupled
+  proof state).  Schema 2 selects one current goal by ``goal_id``; all other
+  goals stay in the tensor graph as context, but only the current goal is
+  decoded and expanded;
 * premise candidates default to the constants that occur in the current goal
   graph; ``premise_scope="global"`` instead exposes the whole checkpoint
   constant vocabulary, which is still not a definition-graph retrieval index;
@@ -23,6 +27,7 @@ import math
 import re
 import time
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -280,15 +285,11 @@ def render_tactic(
             # The NPA induction parameter head names the recursor in
             # `premise`; keep accepting the older `recursor`/`using` aliases for
             # callers that predate that schema.
-            recursor_value = _param(params, "premise")
-            if recursor_value is None:
-                recursor_value = _param(params, "recursor")
-            if recursor_value is None:
-                recursor_value = _param(params, "using")
-            recursor = _premise_name(recursor_value, graph)
-            if not isinstance(recursor, str) or not recursor:
-                return None
-            return f"induction {name} using {recursor}"
+            for key in ("premise", "recursor", "using"):
+                recursor = _premise_name(_param(params, key), graph)
+                if isinstance(recursor, str) and recursor:
+                    return f"induction {name} using {recursor}"
+            return None
         return f"induction {name}"
 
     if kind_enum == TacticKind.REWRITE:
@@ -412,12 +413,100 @@ def _node_features(
     return rows
 
 
+#: Schema-2 node features.  The fourth column is the fraction of the state's
+#: goals rooted at the node (``goal_root_count_norm``, also referred to as
+#: ``n_goals_norm``); it is ``0.0`` for every non-root node and
+#: ``1 / goal_count`` for a goal root.  This matches the v2 training converter
+#: (``experiments/npa_data/convert_trace_v2.py``) so a v2 checkpoint sees the
+#: same feature distribution it was trained on.
+V2_NODE_FEATURE_NAMES: tuple[str, ...] = (
+    "depth_norm",
+    "is_root",
+    "out_degree_norm",
+    "goal_root_count_norm",
+)
+
+
+def _node_features_v2(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    root: int,
+    goal_roots: Sequence[int],
+    width: int,
+) -> list[list[float]]:
+    """Features of a schema-2 proof-state graph, truncated/padded to ``width``.
+
+    ``goal_roots`` are the roots of every goal in the proof state, including
+    the current one.  All nodes from every goal are kept; only the ``is_root``
+    bit marks the selected goal.
+    """
+
+    out_degree: Counter[int] = Counter()
+    for edge in edges:
+        source = edge.get("src", edge.get("source"))
+        if isinstance(source, int):
+            out_degree[source] += 1
+    max_depth = max((int(node.get("depth", 0)) for node in nodes), default=0)
+    max_children = max(out_degree.values(), default=0)
+    goal_root_counts = Counter(goal_roots)
+    goal_count = len(goal_roots)
+    rows: list[list[float]] = []
+    for index, node in enumerate(nodes):
+        depth = int(node.get("depth", 0))
+        base = [
+            depth / max_depth if max_depth > 0 else 0.0,
+            1.0 if index == root else 0.0,
+            out_degree.get(index, 0) / max_children if max_children > 0 else 0.0,
+            goal_root_counts.get(index, 0) / goal_count if goal_count > 0 else 0.0,
+        ]
+        if width <= len(base):
+            row = base[:width]
+        else:
+            row = base + [0.0] * (width - len(base))
+        rows.append(row)
+    return rows
+
+
+def _select_v2_goal(
+    goals: Sequence[Mapping[str, Any]], goal_id: int | str | None
+) -> tuple[Mapping[str, Any], str | None]:
+    """Pick the schema-2 goal that a proposal is for.
+
+    ``goal_id`` may be the REPL goal index, the metavariable *name* used as
+    ``goals[].goal_id``, or ``None`` (use ``goals[0]``).  An unknown selector
+    falls back to ``goals[0]`` and returns a warning instead of crashing a
+    search step.
+    """
+
+    if goal_id is None:
+        return goals[0], None
+    if isinstance(goal_id, bool):
+        return goals[0], f"unsupported goal id {goal_id!r}; using goals[0]"
+    if isinstance(goal_id, int):
+        if 0 <= goal_id < len(goals):
+            return goals[goal_id], None
+        return goals[0], f"goal index {goal_id} outside 0..{len(goals) - 1}; using goals[0]"
+    if isinstance(goal_id, str):
+        for goal in goals:
+            if goal.get("goal_id") == goal_id:
+                return goal, None
+        return goals[0], f"goal {goal_id!r} not in the schema-2 goal table; using goals[0]"
+    return goals[0], f"unsupported goal id {goal_id!r}; using goals[0]"
+
+
 def graph_to_exprgraph(
     goal_graph: Mapping[str, Any],
     vocab: Any,
     device: str | torch.device = "cpu",
+    goal_id: int | str | None = None,
 ) -> GraphView:
-    """Convert a REPL goal graph (schema v1) into an ``ExprGraph`` tensor.
+    """Convert a REPL goal graph (schema 1 or 2) into an ``ExprGraph`` tensor.
+
+    Schema 1 is a single closed goal: the whole graph is used, exactly as in
+    the first version.  Schema 2 is a whole proof state: the graph of the
+    selected goal (``goal_id`` as a REPL index or a ``goals[].goal_id`` name;
+    ``goals[0]`` by default) becomes the root and fvar/locus source, while
+    every node and edge of the state is retained as coupled-goal context.
 
     Unknown constants use the model's unseen-constant path (``constant_id=-1``)
     and unknown edge relations are dropped, because the checkpoint's relation
@@ -427,8 +516,16 @@ def graph_to_exprgraph(
 
     if not isinstance(goal_graph, Mapping):
         raise ValueError("goal graph must be an object")
-    if goal_graph.get("schema") != 1:
-        raise ValueError(f"unsupported goal graph schema: {goal_graph.get('schema')!r}")
+    schema = goal_graph.get("schema")
+    if schema == 2:
+        return _graph_to_exprgraph_v2(goal_graph, vocab, device, goal_id=goal_id)
+    if schema != 1:
+        raise ValueError(f"unsupported goal graph schema: {schema!r}")
+    if goal_id is not None:
+        # A v1 graph has exactly one goal; an explicit selector must not change
+        # its meaning, but silently ignoring a mismatching name would hide a
+        # caller bug.
+        raise ValueError("goal_id is only meaningful for schema-2 goal graphs")
     nodes = goal_graph.get("nodes")
     if not isinstance(nodes, list) or not nodes:
         raise ValueError("goal graph has no nodes")
@@ -542,6 +639,210 @@ def graph_to_exprgraph(
         )
     if dropped_relations:
         warnings.append("dropped edge relations outside checkpoint vocabulary: " + ", ".join(dropped_relations))
+    return GraphView(
+        graph=graph,
+        constant_names=tuple(constant_names),
+        fvar_names=fvar_names,
+        locus_positions=locus_positions,
+        warnings=tuple(warnings),
+    )
+
+
+def _graph_to_exprgraph_v2(
+    goal_graph: Mapping[str, Any],
+    vocab: Any,
+    device: str | torch.device,
+    *,
+    goal_id: int | str | None,
+) -> GraphView:
+    """Convert a schema-2 coupled-goal proof state into a GraphView.
+
+    The selected goal's root becomes the model root and only its fvars/loci
+    become pointer candidates.  All nodes and edges are retained so the other
+    goals stay visible to message passing as coupled context.
+    """
+
+    nodes = goal_graph.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("goal graph has no nodes")
+
+    raw_goals = goal_graph.get("goals")
+    if not isinstance(raw_goals, list) or not raw_goals:
+        raise ValueError("schema-2 goal graph has no goals")
+    goals: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_goals):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"schema-2 goals[{index}] is not an object")
+        entry_goal_id = entry.get("goal_id")
+        entry_root = entry.get("root")
+        if not isinstance(entry_goal_id, str) or not entry_goal_id:
+            raise ValueError(f"schema-2 goals[{index}].goal_id must be a non-empty string")
+        if not isinstance(entry_root, int) or isinstance(entry_root, bool):
+            raise ValueError(f"schema-2 goals[{index}].root must be an integer")
+        if not 0 <= entry_root < len(nodes):
+            raise ValueError(
+                f"schema-2 goals[{index}].root {entry_root} is outside the node range"
+            )
+        goals.append({"goal_id": entry_goal_id, "root": entry_root})
+    goal_ids = [goal["goal_id"] for goal in goals]
+    if len(set(goal_ids)) != len(goal_ids):
+        raise ValueError("schema-2 goal graph contains duplicate goal ids")
+
+    current, selection_warning = _select_v2_goal(goals, goal_id)
+    current_goal_id = str(current["goal_id"])
+    root = int(current["root"])
+    warnings: list[str] = []
+    if selection_warning is not None:
+        warnings.append(selection_warning)
+
+    # Constant table: v2 producers always put the name on the node, but the
+    # condensation table is the authoritative fallback.
+    constants_by_node: dict[int, str] = {}
+    raw_constants = goal_graph.get("constants", [])
+    if not isinstance(raw_constants, list):
+        raise ValueError("goal graph constants must be a list")
+    for index, entry in enumerate(raw_constants):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"goal graph constant {index} is not an object")
+        name = entry.get("name")
+        node_index = entry.get("node")
+        if isinstance(name, str) and name and isinstance(node_index, int):
+            constants_by_node.setdefault(node_index, name)
+
+    constant_lookup = {name: index for index, name in enumerate(vocab.constants)}
+    node_kinds: list[int] = []
+    constant_ids: list[int] = []
+    unknown_constants: list[str] = []
+    for index, node in enumerate(nodes):
+        if not isinstance(node, Mapping):
+            raise ValueError(f"goal graph node {index} is not an object")
+        raw_kind = str(node.get("kind", ""))
+        mapped = NODE_KIND_MAP.get(raw_kind)
+        if mapped is None:
+            raise ValueError(f"goal graph node {index} has unknown kind {raw_kind!r}")
+        kind = NodeKind[mapped]
+        node_kinds.append(int(kind))
+        if kind == NodeKind.CONST:
+            name = node.get("const")
+            if not isinstance(name, str) or not name:
+                name = constants_by_node.get(index)
+            if isinstance(name, str) and name in constant_lookup:
+                constant_ids.append(constant_lookup[name])
+            else:
+                constant_ids.append(-1)
+                if isinstance(name, str) and name and name not in unknown_constants:
+                    unknown_constants.append(name)
+        else:
+            constant_ids.append(-1)
+
+    edges_raw = goal_graph.get("edges", [])
+    if not isinstance(edges_raw, list):
+        raise ValueError("goal graph edges must be a list")
+    sources: list[int] = []
+    targets: list[int] = []
+    edge_types: list[int] = []
+    dropped_relations: list[str] = []
+    relation_lookup = {name: index for index, name in enumerate(vocab.relations)}
+    for edge_index, edge in enumerate(edges_raw):
+        if not isinstance(edge, Mapping):
+            raise ValueError(f"goal graph edge {edge_index} is not an object")
+        source = edge.get("src", edge.get("source"))
+        target = edge.get("dst", edge.get("target"))
+        relation = edge.get("type")
+        if not isinstance(source, int) or not isinstance(target, int):
+            raise ValueError(f"goal graph edge {edge_index} has non-integer endpoints")
+        if not 0 <= source < len(nodes) or not 0 <= target < len(nodes):
+            raise ValueError(f"goal graph edge {edge_index} is outside the node range")
+        if not isinstance(relation, str) or not relation:
+            raise ValueError(f"goal graph edge {edge_index} has no relation name")
+        relation_id = relation_lookup.get(relation)
+        if relation_id is None:
+            if relation not in dropped_relations:
+                dropped_relations.append(relation)
+            continue
+        sources.append(source)
+        targets.append(target)
+        edge_types.append(relation_id)
+
+    features = _node_features_v2(
+        nodes,
+        edges_raw,
+        root,
+        [int(goal["root"]) for goal in goals],
+        vocab.node_feature_dim,
+    )
+    resolved_device = torch.device(device)
+    graph = ExprGraph(
+        node_kinds=torch.tensor(node_kinds, dtype=torch.long, device=resolved_device),
+        edge_index=torch.tensor([sources, targets], dtype=torch.long, device=resolved_device)
+        if sources
+        else torch.empty((2, 0), dtype=torch.long, device=resolved_device),
+        edge_types=torch.tensor(edge_types, dtype=torch.long, device=resolved_device),
+        constant_ids=torch.tensor(constant_ids, dtype=torch.long, device=resolved_device),
+        node_features=torch.tensor(features, dtype=torch.float32, device=resolved_device).reshape(
+            len(nodes), vocab.node_feature_dim
+        ),
+    )
+    graph.validate(vocab.node_feature_dim)
+
+    declared_constants: list[str] = []
+    # Schema 2's condensation table spans the whole proof state; the v2
+    # training converter uses it for premise candidates, so keep every
+    # constant here even though fvars/loci are current-goal scoped.
+    for entry in raw_constants:
+        name = entry.get("name") if isinstance(entry, Mapping) else entry
+        if isinstance(name, str) and name:
+            declared_constants.append(name)
+    for node in nodes:
+        if isinstance(node, Mapping) and isinstance(node.get("const"), str):
+            declared_constants.append(node["const"])
+    constant_names: list[str] = []
+    for name in declared_constants:
+        if name in constant_lookup and name not in constant_names:
+            constant_names.append(name)
+
+    fvar_names: dict[int, str] = {}
+    raw_fvars = goal_graph.get("fvars", [])
+    if not isinstance(raw_fvars, list):
+        raise ValueError("goal graph fvars must be a list")
+    for entry in raw_fvars:
+        if not isinstance(entry, Mapping):
+            continue
+        declared_in = entry.get("goals")
+        if isinstance(declared_in, list) and declared_in and current_goal_id not in declared_in:
+            continue
+        name = entry.get("name")
+        node_index = entry.get("node")
+        if isinstance(name, str) and name and isinstance(node_index, int):
+            fvar_names[node_index] = name
+
+    locus_positions: dict[int, str] = {}
+    raw_loci = goal_graph.get("loci", [])
+    if not isinstance(raw_loci, list):
+        raise ValueError("goal graph loci must be a list")
+    for entry in raw_loci:
+        if not isinstance(entry, Mapping):
+            continue
+        locus_goal_id = entry.get("goal_id")
+        if isinstance(locus_goal_id, str) and locus_goal_id and locus_goal_id != current_goal_id:
+            continue
+        node_index = entry.get("node")
+        position = entry.get("position")
+        if isinstance(node_index, int) and isinstance(position, str):
+            locus_positions.setdefault(node_index, "root" if position == "" else position)
+
+    if unknown_constants:
+        warnings.append(
+            f"{len(unknown_constants)} constant(s) outside checkpoint vocabulary use the unseen-constant path: "
+            + ", ".join(unknown_constants[:8])
+        )
+    if dropped_relations:
+        warnings.append("dropped edge relations outside checkpoint vocabulary: " + ", ".join(dropped_relations))
+    raw_parse_warnings = goal_graph.get("parse_warnings", [])
+    if isinstance(raw_parse_warnings, list):
+        for warning in raw_parse_warnings:
+            if isinstance(warning, str) and warning:
+                warnings.append(f"schema-2 parse warning: {warning}")
     return GraphView(
         graph=graph,
         constant_names=tuple(constant_names),
@@ -772,7 +1073,12 @@ class NPAPolicy(TacticPolicy):
         if not isinstance(goal_graph, Mapping):
             return []
         top_k = max(1, int(top_k))
-        view = graph_to_exprgraph(goal_graph, self.vocab, self.device)
+        view = graph_to_exprgraph(
+            goal_graph,
+            self.vocab,
+            self.device,
+            goal_id=goal_id if goal_graph.get("schema") == 2 else None,
+        )
         candidates = build_candidate_set(
             view, self.vocab, self.device, premise_scope=self.premise_scope
         )
@@ -951,6 +1257,30 @@ def tactical_is_forbidden(tactic: str | None) -> bool:
     return re.search(r"\b(sorry|admit)\b", tactic) is not None
 
 
+def select_policy_graph(
+    goal: Mapping[str, Any], prefer_graph_v2: bool = True
+) -> tuple[Any, Any]:
+    """Return ``(graph, goal_id)`` to hand to a policy for one REPL goal.
+
+    A schema-2 ``graph_v2`` is preferred when the REPL supplied one.  Its
+    per-goal ``graph_v2_goal_id`` (the metavariable name) selects the current
+    goal in the coupled proof state; without it the response ``id`` is still
+    accepted as a goal index.  Otherwise the v1 ``graph`` is returned, so old
+    REPLs and v1 checkpoints keep working unchanged.
+    """
+
+    if prefer_graph_v2:
+        graph_v2 = goal.get("graph_v2")
+        if isinstance(graph_v2, Mapping) and graph_v2.get("schema") == 2:
+            policy_goal_id = goal.get("graph_v2_goal_id")
+            if not isinstance(policy_goal_id, str) or not policy_goal_id:
+                policy_goal_id = goal.get("mvar")
+            if not isinstance(policy_goal_id, str) or not policy_goal_id:
+                policy_goal_id = goal.get("id")
+            return graph_v2, policy_goal_id
+    return goal.get("graph"), goal.get("id")
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -1016,6 +1346,7 @@ class SearchEngine:
         top_k: int = 5,
         strategy: str = "best-first",
         max_failures: int = 200,
+        prefer_graph_v2: bool = True,
     ) -> None:
         if time_limit <= 0:
             raise ValueError("time_limit must be positive")
@@ -1032,6 +1363,7 @@ class SearchEngine:
         self.top_k = int(top_k)
         self.strategy = strategy
         self.max_failures = int(max_failures)
+        self.prefer_graph_v2 = bool(prefer_graph_v2)
 
     def prove(self, theorem: str) -> SearchResult:
         started = time.monotonic()
@@ -1133,8 +1465,11 @@ class SearchEngine:
                 continue
             goal = goals[0]
             goal_id = goal.get("id")
+            graph_for_policy, policy_goal_id = select_policy_graph(goal, self.prefer_graph_v2)
             try:
-                proposals = coerce_proposals(self.policy.propose(goal.get("graph"), goal_id, self.top_k))
+                proposals = coerce_proposals(
+                    self.policy.propose(graph_for_policy, policy_goal_id, self.top_k)
+                )
             except (ReplError, Exception) as exc:
                 failures.append(
                     {
