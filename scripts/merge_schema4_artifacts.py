@@ -122,6 +122,37 @@ def gzip_copy(source: Path, destination: Path, level: int = 1) -> dict[str, Any]
     }
 
 
+class CompressedJsonlWriter:
+    """Write one logical JSONL stream directly into a deterministic gzip."""
+
+    def __init__(self, path: Path, level: int = 1) -> None:
+        self.path = path
+        self._digest = hashlib.sha256()
+        self._bytes = 0
+        self._raw = path.with_suffix(path.suffix + ".tmp").open("wb")
+        self._gzip = gzip.GzipFile(filename="", mode="wb", fileobj=self._raw,
+                                   compresslevel=level, mtime=0)
+
+    def write(self, text: str) -> None:
+        data = (text.rstrip("\n") + "\n").encode("utf-8")
+        self._gzip.write(data)
+        self._digest.update(data)
+        self._bytes += len(data)
+
+    def close(self) -> dict[str, Any]:
+        self._gzip.close()
+        self._raw.close()
+        os.replace(self.path.with_suffix(self.path.suffix + ".tmp"), self.path)
+        return {
+            "name": self.path.name,
+            "sha256": sha256_file(self.path),
+            "uncompressed_sha256": self._digest.hexdigest(),
+            "uncompressed_bytes": self._bytes,
+            "compressed_bytes": self.path.stat().st_size,
+            "gzip_only": True,
+        }
+
+
 def read_json(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         raise ValueError(f"{label} is missing or not a regular file")
@@ -401,7 +432,7 @@ def read_shard_theorems(path: Path) -> list[str]:
 
 def merge(downloads: Path, output: Path, *, plan: dict[str, Any] | None,
           plan_sha: str, shard_count: int | None, limit: int,
-          run_id: str, slice_hint: str = "") -> dict[str, Any]:
+          run_id: str, slice_hint: str = "", gzip_only: bool = False) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     entries = plan_shards(plan, shard_count)
     plan_input_sha = ""
@@ -455,20 +486,40 @@ def merge(downloads: Path, output: Path, *, plan: dict[str, Any] | None,
     steps_out = output / "steps.jsonl"
     theorems_out = output / "theorems.jsonl"
     summaries: list[dict[str, Any]] = []
-    with steps_out.open("w", encoding="utf-8", newline="\n") as step_handle, \
-            theorems_out.open("w", encoding="utf-8", newline="\n") as theorem_handle:
-        for report in accepted:
-            for line in open_jsonl(report["steps_path"]):
-                text = line.rstrip("\n")
-                if text:
-                    step_handle.write(text + "\n")
-            for summary in report["theorems"]:
-                summaries.append(summary)
-                theorem_handle.write(json.dumps(summary, sort_keys=True,
-                                               separators=(",", ":")) + "\n")
-
-    steps_gz = gzip_copy(steps_out, output / "steps.jsonl.gz")
-    theorems_gz = gzip_copy(theorems_out, output / "theorems.jsonl.gz")
+    if gzip_only:
+        # CI package: stream straight into the compressed artifact so a full
+        # 20-shard export never materialises ~10 GB of raw JSONL on the runner.
+        steps_gz = CompressedJsonlWriter(output / "steps.jsonl.gz")
+        theorems_gz = CompressedJsonlWriter(output / "theorems.jsonl.gz")
+        try:
+            for report in accepted:
+                for line in open_jsonl(report["steps_path"]):
+                    if line.strip():
+                        steps_gz.write(line)
+                for summary in report["theorems"]:
+                    summaries.append(summary)
+                    theorems_gz.write(json.dumps(summary, sort_keys=True,
+                                                 separators=(",", ":")))
+        finally:
+            steps_meta = steps_gz.close()
+            theorems_meta = theorems_gz.close()
+    else:
+        with steps_out.open("w", encoding="utf-8", newline="\n") as step_handle, \
+                theorems_out.open("w", encoding="utf-8", newline="\n") as theorem_handle:
+            for report in accepted:
+                for line in open_jsonl(report["steps_path"]):
+                    text = line.rstrip("\n")
+                    if text:
+                        step_handle.write(text + "\n")
+                for summary in report["theorems"]:
+                    summaries.append(summary)
+                    theorem_handle.write(json.dumps(summary, sort_keys=True,
+                                                   separators=(",", ":")) + "\n")
+        steps_meta = {**gzip_copy(steps_out, output / "steps.jsonl.gz"), "gzip_only": False}
+        theorems_meta = {**gzip_copy(theorems_out, output / "theorems.jsonl.gz"),
+                        "gzip_only": False}
+        steps_meta["bytes"] = steps_out.stat().st_size
+        theorems_meta["bytes"] = theorems_out.stat().st_size
     stats = summarize(summaries, reports, accepted, run_id, plan, slice_hint)
     write_json(output / "stats.json", stats)
     (output / "stats.md").write_text(render_markdown(stats), encoding="utf-8")
@@ -501,12 +552,12 @@ def merge(downloads: Path, output: Path, *, plan: dict[str, Any] | None,
         "duplicate_theorems": len(duplicates),
         "shards": reports,
         "artifacts": {
-            "steps": {**{key: steps_gz[key] for key in
-                         ("name", "sha256", "uncompressed_sha256")},
-                      "bytes": steps_gz["uncompressed_bytes"]},
-            "theorems": {**{key: theorems_gz[key] for key in
-                           ("name", "sha256", "uncompressed_sha256")},
-                         "bytes": theorems_gz["uncompressed_bytes"]},
+            "steps": {key: steps_meta[key] for key in
+                      ("name", "sha256", "uncompressed_sha256", "uncompressed_bytes",
+                       "compressed_bytes", "gzip_only")},
+            "theorems": {key: theorems_meta[key] for key in
+                         ("name", "sha256", "uncompressed_sha256", "uncompressed_bytes",
+                          "compressed_bytes", "gzip_only")},
         },
     }
     write_json(output / "merge-report.json", report)
@@ -656,6 +707,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--slice", default="", help="slice path recorded in provenance")
     parser.add_argument("--step-summary", type=Path, default=None)
+    parser.add_argument("--gzip-only", action="store_true",
+                        help="write only steps.jsonl.gz/theorems.jsonl.gz (CI package)")
     args = parser.parse_args(argv)
 
     try:
@@ -674,7 +727,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.downloads, args.output, plan=plan, plan_sha=plan_sha,
             shard_count=args.shard_count, limit=args.limit,
             run_id=args.run_id or time.strftime("schema4-merge-%Y%m%d-%H%M%S"),
-            slice_hint=args.slice,
+            slice_hint=args.slice, gzip_only=args.gzip_only,
         )
     except (OSError, ValueError) as exc:
         print(f"merge_schema4_artifacts: {exc}", file=sys.stderr)

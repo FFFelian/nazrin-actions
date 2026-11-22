@@ -91,7 +91,10 @@ plan digest, shard digest, meta count and schema-4 envelope, then writes
 `steps.jsonl(.gz)`, `theorems.jsonl(.gz)`, `stats.json/md`,
 `merge-report.json`, and `provenance.json`. Field sizes differ by theorem; the
 local `structured-v4-slice00-*` runs measured about 470 KB of steps per theorem,
-which is roughly 40-50 MB of gzip per 20-way shard.
+which is roughly 40-50 MB of gzip per 20-way shard. The merge job passes
+`--gzip-only`, so the package artifact holds `steps.jsonl.gz` (about 0.9 GB for
+the full 20,603-row stdlib slice) instead of ~10 GB of raw JSONL; local merge
+runs keep raw `steps.jsonl` unless the flag is passed.
 
 ```bash
 gh workflow run schema4-trace-export.yml \

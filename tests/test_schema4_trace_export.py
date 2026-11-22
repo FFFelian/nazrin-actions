@@ -286,9 +286,12 @@ class WorkflowTests(unittest.TestCase):
         fail_index = names.index("Fail workflow if the package is incomplete")
         self.assertLess(upload_index, fail_index)
         self.assertIn("merge-report.json", steps[fail_index]["run"])
+        sample = steps[names.index("Validate a merged-record sample (report only)")]["run"]
+        self.assertIn("steps.jsonl.gz", sample)
+        self.assertIn("validation-sample.jsonl", sample)
         run = steps[names.index("Merge schema-4 shards")]["run"]
         for token in ("scripts/merge_schema4_artifacts.py", "--expected-plan-sha",
-                      '--output "$RUNNER_TEMP/schema4-package"',
+                      '--output "$RUNNER_TEMP/schema4-package"', "--gzip-only",
                       '--step-summary "$GITHUB_STEP_SUMMARY"'):
             self.assertIn(token, run)
 
@@ -543,6 +546,34 @@ class MergeTests(unittest.TestCase):
             self.assertIn("Schema-4 structured trace package",
                           (root / "package/stats.md").read_text())
             self.assertIn("### Schema-4 trace package", (root / "summary.md").read_text())
+
+    def test_gzip_only_package_streams_compressed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan_dir, plan, digest = self.make_plan(root, 20, 2)
+            downloads = root / "downloads"
+            for identifier in range(2):
+                self.run_shard(plan_dir, plan, identifier, downloads, digest)
+            result = run_cli([
+                str(MERGER), "--plan", str(plan_dir / "plan.json"),
+                "--downloads", str(downloads), "--output", str(root / "package"),
+                "--run-id", "777", "--expected-plan-sha", digest, "--gzip-only",
+            ])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            package = root / "package"
+            self.assertFalse((package / "steps.jsonl").exists())
+            self.assertFalse((package / "theorems.jsonl").exists())
+            steps = gzip.decompress((package / "steps.jsonl.gz").read_bytes()).splitlines()
+            theorems = gzip.decompress((package / "theorems.jsonl.gz").read_bytes()).splitlines()
+            self.assertEqual(len(theorems), 20)
+            self.assertEqual(len(steps), 40)
+            report = json.loads((package / "merge-report.json").read_text())
+            self.assertTrue(report["complete"], report)
+            self.assertTrue(report["artifacts"]["steps"]["gzip_only"])
+            payload = gzip.decompress((package / "steps.jsonl.gz").read_bytes())
+            self.assertEqual(report["artifacts"]["steps"]["uncompressed_bytes"], len(payload))
+            self.assertEqual(report["artifacts"]["steps"]["uncompressed_sha256"],
+                             hashlib.sha256(payload).hexdigest())
 
     def test_tampered_shard_is_rejected_and_the_other_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
