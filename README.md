@@ -93,7 +93,7 @@ plan digest, shard digest, meta count and schema-4 envelope, then writes
 local `structured-v4-slice00-*` runs measured about 470 KB of steps per theorem,
 which is roughly 40-50 MB of gzip per 20-way shard. The merge job passes
 `--gzip-only`, so the package artifact holds `steps.jsonl.gz` (about 0.9 GB for
-the full 20,603-row stdlib slice) instead of ~10 GB of raw JSONL; local merge
+the full 20,602-row stdlib slice) instead of ~10 GB of raw JSONL; local merge
 runs keep raw `steps.jsonl` unless the flag is passed.
 
 ```bash
