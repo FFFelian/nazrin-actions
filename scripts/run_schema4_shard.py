@@ -62,6 +62,7 @@ import hashlib
 import json
 import os
 import shlex
+import signal
 import statistics
 import subprocess
 import sys
@@ -418,24 +419,42 @@ def run_theorem(cfg: Config, row: SliceRow, exporter: list[str],
     returncode: int | None = None
     timed_out = False
     launch_error = ""
+    process: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv,
             cwd=str(cfg.repo),
             env=exporter_env(cfg),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=cfg.timeout_seconds,
+            start_new_session=True,
         )
-        returncode = completed.returncode
-        stderr_tail = (completed.stderr or "")[-4000:]
-        stdout_tail = (completed.stdout or "")[-1000:]
-    except subprocess.TimeoutExpired as exc:
+        try:
+            stdout, stderr = process.communicate(timeout=cfg.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            stage_override = "wall_timeout"
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            stderr_tail = ((stderr or "") if isinstance(stderr, str) else "")[-4000:]
+            stdout_tail = ((stdout or "") if isinstance(stdout, str) else "")[-1000:]
+            out_path.write_text("", encoding="utf-8")  # never keep a half-written file
+            raise
+        returncode = process.returncode
+        stderr_tail = (stderr or "")[-4000:]
+        stdout_tail = (stdout or "")[-1000:]
+    except subprocess.TimeoutExpired:
+        # The timeout branch above already killed the whole process group.
         timed_out = True
         stage_override = "wall_timeout"
-        stderr_tail = ((exc.stderr or "") if isinstance(exc.stderr, str) else "")[-4000:]
-        stdout_tail = ((exc.stdout or "") if isinstance(exc.stdout, str) else "")[-1000:]
-        out_path.write_text("", encoding="utf-8")  # never keep a half-written file
+        out_path.write_text("", encoding="utf-8")
     except OSError as exc:
         launch_error = f"{type(exc).__name__}: {exc}"
         stage_override = "launch_error"
