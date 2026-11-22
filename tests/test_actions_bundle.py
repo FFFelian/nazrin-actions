@@ -45,11 +45,13 @@ class ActionsBundleTests(unittest.TestCase):
                 WORKFLOW,
                 WORKFLOW_DIR / "paper-proof-eval.yml",
                 WORKFLOW_DIR / "paper-trace-export.yml",
+                WORKFLOW_DIR / "schema4-trace-export.yml",
             ],
         )
         paper_trace = (WORKFLOW_DIR / "paper-trace-export.yml").read_text(encoding="utf-8")
         paper_eval = (WORKFLOW_DIR / "paper-proof-eval.yml").read_text(encoding="utf-8")
-        all_workflows = self.text + paper_trace + paper_eval
+        schema4 = (WORKFLOW_DIR / "schema4-trace-export.yml").read_text(encoding="utf-8")
+        all_workflows = self.text + paper_trace + paper_eval + schema4
         self.assertIn("workflow_dispatch:", all_workflows)
         self.assertNotRegex(all_workflows, r"(?m)^\s*(push|pull_request|schedule|workflow_run):")
         self.assertNotRegex(all_workflows + self.setup, r"\bgit(?:\s+-C\s+\S+)?\s+push\b|--mirror\b")

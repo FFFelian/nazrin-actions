@@ -1,0 +1,32 @@
+-- Schema-4 structured-trace overlay additions.
+--
+-- This file is appended only by `.github/workflows/schema4-trace-export.yml`.
+-- The old `paper-trace-export.yml` keeps appending `lakefile.append` so it never
+-- sees a Lake target whose root file it does not install.
+--
+-- `scripts/setup_runtime.sh` (via `scripts/verify_source.py --assemble`) already
+-- writes `Standalone/AtomizerCore.lean` and declares its `lean_lib AtomizerCore`
+-- target. `Standalone/GoalGraphCore.lean` is installed by this overlay, so its
+-- library target has to be declared here as well.
+--
+-- The exporter is a *per-theorem* program: `StructuredTraceV4 MODULE THEOREM
+-- OUTPUT_PATH` writes one schema-4 JSONL file per theorem. `run_schema4_shard.py`
+-- invokes it through either `lake env lean --run` (needs the oleans below) or
+-- the built executable.
+
+lean_lib GoalGraphCore {
+  roots := #[`Standalone.GoalGraphCore]
+}
+
+lean_lib ExprGraphV2 {
+  roots := #[`Standalone.ExprGraphV2]
+}
+
+lean_lib ExprGraphV3 {
+  roots := #[`Standalone.ExprGraphV3]
+}
+
+lean_exe StructuredTraceV4 {
+  root := `Standalone.StructuredTraceV4
+  supportInterpreter := true
+}

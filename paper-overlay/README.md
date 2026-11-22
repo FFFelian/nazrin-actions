@@ -43,6 +43,38 @@ a fresh checkout and verifies both executable declarations. The overlay's
 `AtomizerCore` copy is a fallback only: the workflow does not overwrite the
 runtime-generated file when it is already present.
 
+## Schema-4 structured trace additions
+
+[`schema4-trace-export.yml`](../.github/workflows/schema4-trace-export.yml)
+exports the schema-4 atomization trace (`Standalone/StructuredTraceV4.lean`)
+with up to 20 parallel shards. It reuses `scripts/setup_runtime.sh` and
+`scripts/plan_paper_shards.py`, then runs one isolated Lean process per
+theorem through `scripts/run_schema4_shard.py`.
+
+The schema-4 exporter needs five overlay files that were not part of the old
+trace snapshot:
+
+| File | Why it is installed |
+| --- | --- |
+| `Standalone/StructuredTraceV4.lean` | per-theorem schema-4 JSONL exporter (`schema_version` 4) |
+| `Standalone/ExprGraphV3.lean` | schema-3 ExprGraph of the full pre-step goal state (§V-A pp.6-7) |
+| `Standalone/ExprGraphV2.lean` | direct import of `ExprGraphV3`; not in the pinned base |
+| `experiments/exprgraph/v3/validate_exprgraph_v3.py` | graph validator used by the schema-4 checker |
+| `experiments/npa_data/validate_structured_v4.py` | independent schema-4 record checker (merge job, report only) |
+
+`Standalone/GoalGraphCore.lean` and `Standalone/AtomizerCore.lean` are already
+overlay/runtime files (`AtomizerCore` is assembled from the upstream atomizer
+by `verify_source.py`). A second append file,
+[`lakefile.schema4.append`](lakefile.schema4.append), declares the
+`ExprGraphV2`/`ExprGraphV3` libraries and the `StructuredTraceV4` executable.
+It is kept separate from `lakefile.append` so the old exporter workflow never
+sees a Lake target whose root file it does not install.
+
+`scripts/setup_runtime.sh` and the runtime assembly are unchanged: the new
+modules are copied after assembly into the same disposable checkout. Every
+file is listed in `SHA256SUMS` and verified before installation; the local
+source bytes are the origin of the copy, as with the old snapshot.
+
 ## Deliberate exclusions
 
 - `.lake/`, build products, caches, and checkpoints.

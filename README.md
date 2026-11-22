@@ -1,6 +1,6 @@
 # Nazrin Actions orchestration
 
-This repository contains independent runner extensions and one manual GitHub Actions workflow, [mathlib-atomization.yml](.github/workflows/mathlib-atomization.yml). At runtime it fetches the official Nazrin base directly from Codeberg, assembles the extensions in a disposable checkout, builds the worker, exports the full pinned Mathlib inventory, assigns deterministic theorem shards, and packages verified results. Upstream source is neither mirrored here nor included in uploaded result artifacts.
+This repository contains independent runner extensions and manual GitHub Actions workflows: [mathlib-atomization.yml](.github/workflows/mathlib-atomization.yml), [paper-trace-export.yml](.github/workflows/paper-trace-export.yml), [paper-proof-eval.yml](.github/workflows/paper-proof-eval.yml), and [schema4-trace-export.yml](.github/workflows/schema4-trace-export.yml). At runtime it fetches the official Nazrin base directly from Codeberg, assembles the extensions in a disposable checkout, builds the worker, exports the full pinned Mathlib inventory, assigns deterministic theorem shards, and packages verified results. Upstream source is neither mirrored here nor included in uploaded result artifacts.
 
 ## Reproducible runtime assembly
 
@@ -58,3 +58,57 @@ bash -n scripts/setup_runtime.sh
 ```
 
 Tests use temporary fixtures and do not run Lean or alter an existing scan. A clean cloud bootstrap and the real worker integration check establish whether the selected runtime can proceed to the full scan.
+
+## Schema-4 structured trace export (20 shards)
+
+[schema4-trace-export.yml](.github/workflows/schema4-trace-export.yml) runs the
+schema-4 atomization exporter (`Standalone/StructuredTraceV4.lean`, from
+[paper-overlay](paper-overlay)) on a pinned checkout, one isolated Lean process
+per theorem, in up to 20 parallel shards. It exists so the export does not need
+to fit in one local machine's memory: each theorem writes its own JSONL file,
+and a shard's artifacts are validated and merged by a separate job.
+
+Dispatch inputs (the GitHub `workflow_dispatch` API allows at most 10):
+
+- `slice` (default `paper-overlay/paper-slices/slice-00.tsv`), `start`/`end`
+  (row window, `end=-1` = all), `limit` (per-shard row cap, `0` = all),
+- `shard_count` (default 20), `max_parallel` (default 20),
+- `heartbeats` (default 200000) and `timeout_seconds` (default 180) per theorem,
+- `source_ref` (must equal `runtime/manifest.json`'s `source_commit`) and
+  `runner_label` (default `ubuntu-24.04`).
+
+The Mathlib commit is resolved from [runtime/manifest.json](runtime/manifest.json)
+so the pin has a single source of truth. The workflow builds
+`StructuredTraceV4` once per job and then invokes the exporter per theorem. It
+uses `--exporter-mode lean-run` (`lake env lean --run
+Standalone/StructuredTraceV4.lean MODULE THEOREM OUTPUT.jsonl`); the runner also
+supports the built binary for faster reruns (`--exporter-mode binary`).
+
+Outputs per shard: `steps.jsonl.gz`, `theorems.jsonl.gz`, `stats.json`,
+`stats.md`, `provenance.json`, `state.json`, `shard.tsv`, `meta.json`, and
+`work.tgz` with the raw per-theorem checkpoints. The merge job validates every
+plan digest, shard digest, meta count and schema-4 envelope, then writes
+`steps.jsonl(.gz)`, `theorems.jsonl(.gz)`, `stats.json/md`,
+`merge-report.json`, and `provenance.json`. Field sizes differ by theorem; the
+local `structured-v4-slice00-*` runs measured about 470 KB of steps per theorem,
+which is roughly 40-50 MB of gzip per 20-way shard.
+
+```bash
+gh workflow run schema4-trace-export.yml \
+  -f shard_count=20 -f max_parallel=20 -f limit=0
+gh run watch "$(gh run list --workflow schema4-trace-export.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+
+# Download the merged package, or a single shard, from a finished run:
+gh run download <run-id> -n schema4-package-<run-id>-1 -D schema4-package
+# Local merge of downloaded shard artifacts (plan.json comes from the plan artifact):
+python3 scripts/merge_schema4_artifacts.py \
+  --plan plan/plan.json --downloads downloaded-shards \
+  --output schema4-package --expected-plan-sha "$(sha256sum plan/plan.json | cut -d' ' -f1)"
+# Independent record check (report only in CI):
+python3 paper-overlay/experiments/npa_data/validate_structured_v4.py --stats \
+  schema4-package/steps.jsonl
+```
+
+The exporter is the same one used by the local Gate 1.4a runs; this workflow
+does not change the atomizer, the model, the training data, or any local
+`experiments/paper-traces/structured-v4-*` directory. It runs no training.
