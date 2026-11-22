@@ -183,7 +183,7 @@ def load_plan(path: Path | None, expected_count: int | None) -> dict[str, Any] |
         raise ValueError("plan schema must be 1")
     count = plan.get("shard_count")
     if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 20:
-        raise ValueError("plan shard_count must be an integer from 1 to 20")
+        raise ValueError("plan shard_count must be an integer from 1 to 32")
     if expected_count is not None and count != expected_count:
         raise ValueError(f"plan shard_count {count} does not match dispatch count {expected_count}")
     shards = plan.get("shards")
@@ -208,7 +208,7 @@ def plan_shards(plan: dict[str, Any] | None, shard_count: int | None) -> list[di
         return list(plan["shards"])
     count = shard_count if shard_count is not None else 0
     if not 1 <= count <= 20:
-        raise ValueError("without --plan, --shard-count from 1 to 20 is required")
+        raise ValueError("without --plan, --shard-count from 1 to 32 is required")
     return [{"id": identifier, "file": "", "rows": -1, "sha256": ""}
             for identifier in range(count)]
 

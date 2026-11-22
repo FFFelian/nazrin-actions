@@ -1,0 +1,81 @@
+name: Merge schema-4 artifacts
+
+'on':
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Run id containing schema4-plan-* and schema4-shard-* artifacts
+        required: true
+        type: string
+      shard_count:
+        description: Number of shards in the plan
+        required: true
+        type: number
+        default: 32
+      limit:
+        description: Limit passed to the original export (0 = all)
+        required: true
+        type: number
+        default: 0
+      slice:
+        description: Slice path recorded in provenance
+        required: true
+        type: string
+        default: paper-overlay/paper-slices/slice-00.tsv
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: schema4-plan-*
+          path: plan
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: schema4-shard-*
+          path: shards
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: false
+
+      - name: Merge and validate
+        env:
+          RUN_ID: ${{ inputs.source_run_id }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          LIMIT: ${{ inputs.limit }}
+          SLICE: ${{ inputs.slice }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/merge_schema4_artifacts.py \
+            --plan plan/plan.json \
+            --downloads shards \
+            --output schema4-package \
+            --run-id "$RUN_ID" \
+            --shard-count "$SHARD_COUNT" \
+            --limit "$LIMIT" \
+            --slice "$SLICE" \
+            --gzip-only \
+            --step-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: schema4-package-${{ inputs.source_run_id }}
+          path: schema4-package/
+          if-no-files-found: error
