@@ -14,7 +14,7 @@ from pathlib import Path
 import sys
 
 
-MAX_SHARDS = 20
+MAX_SHARDS = 32
 
 
 def _sha256(data: bytes) -> str:
